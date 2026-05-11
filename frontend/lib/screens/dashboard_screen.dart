@@ -12,6 +12,7 @@ import 'login_screen.dart';
 import 'ph_history_screen.dart';
 import 'feeding_history_screen.dart';
 import 'jadwal_screen.dart';
+import 'riwayat_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -251,6 +252,17 @@ class _DashboardScreenState extends State<DashboardScreen>
         transitionDuration: const Duration(milliseconds: 380),
       ),
     );
+  }
+
+  void _bukaRiwayat() {
+    if (_kolamInfo != null) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => RiwayatScreen(idKolam: _kolamInfo!['id_kolam'] as int),
+        ),
+      );
+    }
   }
 
   // =========================================================================
@@ -783,6 +795,8 @@ class _DashboardScreenState extends State<DashboardScreen>
         _buildManualFeedButton(idKolam),
         const SizedBox(height: 10),
         _buildJadwalButton(),
+        const SizedBox(height: 10),
+        _buildRiwayatButton(),
       ],
     );
   }
@@ -877,6 +891,79 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Widget _buildJadwalButton() => _JadwalButton(onTap: _bukaJadwalPakan);
+
+  Widget _buildRiwayatButton() {
+    return GestureDetector(
+      onTap: _bukaRiwayat,
+      child: Container(
+        height: 52,
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFF009E83).withOpacity(0.3)),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x14009E83),
+              blurRadius: 10,
+              offset: Offset(0, 3),
+            ),
+          ],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: Row(
+            children: [
+              Container(
+                width: 32,
+                height: 32,
+                decoration: BoxDecoration(
+                  color: const Color(0x14009E83),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: const Color(0x33009E83)),
+                ),
+                child: const Icon(
+                  Icons.history,
+                  color: Color(0xFF009E83),
+                  size: 16,
+                ),
+              ),
+              const SizedBox(width: 14),
+              const Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'RIWAYAT HARIAN',
+                      style: TextStyle(
+                        color: Color(0xFF009E83),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1.5,
+                      ),
+                    ),
+                    SizedBox(height: 2),
+                    Text(
+                      'Lihat data pH, pakan, & riwayat feeder',
+                      style: TextStyle(
+                        color: Color(0xFF4A7A72),
+                        fontSize: 10,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(
+                Icons.arrow_forward_ios_rounded,
+                color: Color(0xFF009E83),
+                size: 14,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 
   Widget _buildDivider() => Container(
     margin: const EdgeInsets.symmetric(vertical: 12),

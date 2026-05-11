@@ -6,7 +6,7 @@ import '../config.dart';
 class DashboardService {
   Future<Map<String, dynamic>?> getKolamInfo() async {
     await Future.delayed(const Duration(milliseconds: 500));
-    return {'id_kolam': 1, 'nama_kolam': 'Kolam Bioflok Alpha'};
+    return {'id_kolam': 1, 'nama_kolam': 'Kolam Empang Lele'};
   }
 
   Future<void> triggerPakanManual() async {
