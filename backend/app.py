@@ -122,9 +122,12 @@ def cek_dan_eksekusi_jadwal():
     sekarang = datetime.now()
     ada_jadwal = any(j['jam'] == sekarang.hour and j['menit'] == sekarang.minute for j in daftar_jadwal)
 
-    if ada_jadwal and menit_jadwal_terakhir != sekarang.minute:
-        menit_jadwal_terakhir = sekarang.minute
-        mulai_pakan()
+    if ada_jadwal:
+        if menit_jadwal_terakhir != sekarang.minute:
+            menit_jadwal_terakhir = sekarang.minute
+            mulai_pakan()
+    else:
+        menit_jadwal_terakhir = -1
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=cek_dan_eksekusi_jadwal, trigger="interval", seconds=10)
@@ -341,6 +344,9 @@ def kelola_jadwal():
         if jam is None or menit is None: 
             return jsonify({"error": "Format tidak valid"}), 400
             
+        if any(j['jam'] == jam and j['menit'] == menit for j in daftar_jadwal):
+            return jsonify({"error": "Jadwal pada waktu tersebut sudah ada"}), 409
+            
         try:
             # 1. Simpan (Insert) ke Supabase
             data_insert = {"jam": jam, "menit": menit}
@@ -362,17 +368,31 @@ def kelola_jadwal():
             return jsonify({"error": "Gagal menyimpan jadwal"}), 500
             
     elif request.method == 'DELETE':
+        ids_hapus = request.args.get('ids')
         id_hapus = request.args.get('id', type=int)
         
         try:
-            # 1. Hapus dari Supabase berdasarkan ID
-            supabase.table("jadwal_pakan").delete().eq("id", id_hapus).execute()
-            
-            # 2. Hapus dari variabel lokal di RAM
-            daftar_jadwal = [j for j in daftar_jadwal if j.get('id') != id_hapus]
-            
-            print(f"🗑️ [DATABASE] Jadwal dengan ID {id_hapus} dihapus.")
-            return jsonify({"status": "sukses"})
+            if ids_hapus:
+                list_ids = [int(i) for i in ids_hapus.split(',') if i.strip()]
+                if not list_ids:
+                    return jsonify({"error": "ID tidak valid"}), 400
+                
+                supabase.table("jadwal_pakan").delete().in_("id", list_ids).execute()
+                daftar_jadwal = [j for j in daftar_jadwal if j.get('id') not in list_ids]
+                
+                print(f"🗑️ [DATABASE] {len(list_ids)} jadwal berhasil dihapus secara massal.")
+                return jsonify({"status": "sukses"})
+            elif id_hapus is not None:
+                # 1. Hapus dari Supabase berdasarkan ID
+                supabase.table("jadwal_pakan").delete().eq("id", id_hapus).execute()
+                
+                # 2. Hapus dari variabel lokal di RAM
+                daftar_jadwal = [j for j in daftar_jadwal if j.get('id') != id_hapus]
+                
+                print(f"🗑️ [DATABASE] Jadwal dengan ID {id_hapus} dihapus.")
+                return jsonify({"status": "sukses"})
+            else:
+                return jsonify({"error": "ID tidak ditemukan"}), 400
             
         except Exception as e:
             print(f"❌ [DATABASE] Error Delete Jadwal: {e}")

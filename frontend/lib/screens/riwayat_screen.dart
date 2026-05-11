@@ -515,12 +515,31 @@ class _DailyCard extends StatelessWidget {
       dayData.sisaPakan > 0 ||
       dayData.jumlahAutoFeeder > 0;
 
-  bool get isToday => index == 0;
+  bool get isToday {
+    final now = DateTime.now();
+    return dayData.date.year == now.year &&
+        dayData.date.month == now.month &&
+        dayData.date.day == now.day;
+  }
+
+  bool get isYesterday {
+    final yesterday = DateTime.now().subtract(const Duration(days: 1));
+    return dayData.date.year == yesterday.year &&
+        dayData.date.month == yesterday.month &&
+        dayData.date.day == yesterday.day;
+  }
 
   String get dayLabel {
-    if (index == 0) return 'Hari Ini';
-    if (index == 1) return 'Kemarin';
-    return '$index hari lalu';
+    if (isToday) return 'Hari Ini';
+    if (isYesterday) return 'Kemarin';
+
+    final now = DateTime.now();
+    final dDate = DateTime(dayData.date.year, dayData.date.month, dayData.date.day);
+    final dNow = DateTime(now.year, now.month, now.day);
+    final diff = dNow.difference(dDate).inDays;
+
+    if (diff > 0) return '$diff hari lalu';
+    return '';
   }
 
   @override

@@ -38,6 +38,10 @@ class _JadwalScreenState extends State<JadwalScreen>
   List daftarJadwal = [];
   bool isLoading = false;
 
+  // State Multi-Select
+  bool isSelectionMode = false;
+  Set<int> selectedIds = {};
+
   // Animasi
   late AnimationController _fadeCtrl;
   late AnimationController _pulseCtrl;
@@ -109,14 +113,41 @@ class _JadwalScreenState extends State<JadwalScreen>
   }
 
   Future<void> tambahJadwal(int jam, int menit) async {
+    bool exists = daftarJadwal.any((j) => j['jam'] == jam && j['menit'] == menit);
+    if (exists) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Jadwal ${jam.toString().padLeft(2, '0')}:${menit.toString().padLeft(2, '0')} sudah ada!"),
+          backgroundColor: _kRed,
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          margin: const EdgeInsets.all(16),
+        ),
+      );
+      return;
+    }
+
     try {
       final response = await http.post(
         Uri.parse(baseUrl),
         headers: {"Content-Type": "application/json"},
         body: jsonEncode({"jam": jam, "menit": menit}),
       );
+      
+      if (!mounted) return;
+      
       if (response.statusCode == 201) {
         fetchJadwal();
+      } else if (response.statusCode == 409) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text("Gagal: Jadwal sudah ada di server!"),
+            backgroundColor: _kRed,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            margin: const EdgeInsets.all(16),
+          ),
+        );
       }
     } catch (e) {
       debugPrint("Error Add: $e");
@@ -131,6 +162,34 @@ class _JadwalScreenState extends State<JadwalScreen>
       }
     } catch (e) {
       debugPrint("Error Delete: $e");
+    }
+  }
+
+  Future<void> hapusSemuaJadwal() async {
+    if (selectedIds.isEmpty) return;
+    try {
+      final idsParam = selectedIds.join(',');
+      final response = await http.delete(Uri.parse("$baseUrl?ids=$idsParam"));
+      if (response.statusCode == 200) {
+        setState(() {
+          isSelectionMode = false;
+          selectedIds.clear();
+        });
+        fetchJadwal();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text("Jadwal terpilih berhasil dihapus!"),
+              backgroundColor: _kTeal,
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              margin: const EdgeInsets.all(16),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint("Error Delete Batch: $e");
     }
   }
 
@@ -224,6 +283,33 @@ class _JadwalScreenState extends State<JadwalScreen>
     );
   }
 
+  void _konfirmasiHapusSemua() {
+    if (selectedIds.isEmpty) return;
+    HapticFeedback.lightImpact();
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _HapusBottomSheet(
+        label: "${selectedIds.length} JADWAL TERPILIH",
+        onKonfirmasi: () {
+          Navigator.pop(context);
+          hapusSemuaJadwal();
+        },
+      ),
+    );
+  }
+
+  void toggleSelection(int id) {
+    setState(() {
+      if (selectedIds.contains(id)) {
+        selectedIds.remove(id);
+        if (selectedIds.isEmpty) isSelectionMode = false;
+      } else {
+        selectedIds.add(id);
+      }
+    });
+  }
+
   // =========================================================================
   // BUILD
   // =========================================================================
@@ -261,66 +347,107 @@ class _JadwalScreenState extends State<JadwalScreen>
           ),
         ),
       ),
-      title: Row(
-        children: [
-          TweenAnimationBuilder<double>(
-            tween: Tween(begin: 0.5, end: 1.0),
-            duration: const Duration(milliseconds: 700),
-            curve: Curves.elasticOut,
-            builder: (_, v, child) => Transform.scale(scale: v, child: child),
-            child: Container(
-              width: 32,
-              height: 32,
-              decoration: BoxDecoration(
-                border: Border.all(color: _kTeal, width: 1),
-                borderRadius: BorderRadius.circular(8),
-                color: _kTeal.withOpacity(0.10),
+      leading: isSelectionMode
+          ? IconButton(
+              icon: const Icon(Icons.close_rounded, color: _kTextPri),
+              onPressed: () => setState(() {
+                isSelectionMode = false;
+                selectedIds.clear();
+              }),
+            )
+          : null,
+      title: isSelectionMode
+          ? Text(
+              '${selectedIds.length} Dipilih',
+              style: const TextStyle(
+                color: _kTextPri,
+                fontWeight: FontWeight.bold,
+                fontSize: 18,
               ),
-              child: const Icon(
-                Icons.schedule_rounded,
-                color: _kTeal,
-                size: 16,
+            )
+          : Row(
+              children: [
+                TweenAnimationBuilder<double>(
+                  tween: Tween(begin: 0.5, end: 1.0),
+                  duration: const Duration(milliseconds: 700),
+                  curve: Curves.elasticOut,
+                  builder: (_, v, child) => Transform.scale(scale: v, child: child),
+                  child: Container(
+                    width: 32,
+                    height: 32,
+                    decoration: BoxDecoration(
+                      border: Border.all(color: _kTeal, width: 1),
+                      borderRadius: BorderRadius.circular(8),
+                      color: _kTeal.withOpacity(0.10),
+                    ),
+                    child: const Icon(
+                      Icons.schedule_rounded,
+                      color: _kTeal,
+                      size: 16,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    ShaderMask(
+                      shaderCallback: (b) => const LinearGradient(
+                        colors: [_kTealDeep, _kTeal],
+                      ).createShader(b),
+                      child: const Text(
+                        'JADWAL PAKAN',
+                        style: TextStyle(
+                          color: Colors.black,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 3,
+                          fontSize: 16,
+                        ),
+                      ),
+                    ),
+                    const Text(
+                      'V.I.S.I.O.N FEEDING SCHEDULER',
+                      style: TextStyle(
+                        color: _kTextTer,
+                        fontSize: 9,
+                        letterSpacing: 1.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+      actions: [
+        if (isSelectionMode && selectedIds.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(right: 16),
+            child: TextButton.icon(
+              onPressed: _konfirmasiHapusSemua,
+              icon: const Icon(Icons.delete_outline_rounded, color: _kRed, size: 20),
+              label: const Text(
+                'HAPUS',
+                style: TextStyle(
+                  color: _kRed,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.2,
+                ),
+              ),
+              style: TextButton.styleFrom(
+                backgroundColor: _kRed.withOpacity(0.1),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
               ),
             ),
           ),
-          const SizedBox(width: 12),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              ShaderMask(
-                shaderCallback: (b) => const LinearGradient(
-                  colors: [_kTealDeep, _kTeal],
-                ).createShader(b),
-                child: const Text(
-                  'JADWAL PAKAN',
-                  style: TextStyle(
-                    color: Colors.black,
-                    fontWeight: FontWeight.w900,
-                    letterSpacing: 3,
-                    fontSize: 16,
-                  ),
-                ),
-              ),
-              const Text(
-                'V.I.S.I.O.N FEEDING SCHEDULER',
-                style: TextStyle(
-                  color: _kTextTer,
-                  fontSize: 9,
-                  letterSpacing: 1.5,
-                ),
-              ),
-            ],
+        if (!isSelectionMode)
+          Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: _AnimatedIconButton(
+              icon: Icons.refresh_rounded,
+              onTap: fetchJadwal,
+            ),
           ),
-        ],
-      ),
-      actions: [
-        Padding(
-          padding: const EdgeInsets.only(right: 8),
-          child: _AnimatedIconButton(
-            icon: Icons.refresh_rounded,
-            onTap: fetchJadwal,
-          ),
-        ),
       ],
     );
   }
@@ -441,6 +568,22 @@ class _JadwalScreenState extends State<JadwalScreen>
             menit: item['menit'],
             label: label,
             entryIndex: index - 1,
+            isSelected: selectedIds.contains(item['id']),
+            isSelectionMode: isSelectionMode,
+            onTap: () {
+              if (isSelectionMode) {
+                toggleSelection(item['id']);
+              }
+            },
+            onLongPress: () {
+              if (!isSelectionMode) {
+                setState(() {
+                  isSelectionMode = true;
+                  selectedIds.add(item['id']);
+                });
+                HapticFeedback.mediumImpact();
+              }
+            },
             onHapus: () => _konfirmasiHapus(item['id'], label),
           );
         },
@@ -636,13 +779,22 @@ class _JadwalTile extends StatefulWidget {
   final int jam, menit, entryIndex;
   final String label;
   final VoidCallback onHapus;
+  final bool isSelected;
+  final bool isSelectionMode;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
 
   const _JadwalTile({
+    super.key,
     required this.jam,
     required this.menit,
     required this.label,
     required this.entryIndex,
     required this.onHapus,
+    this.isSelected = false,
+    this.isSelectionMode = false,
+    required this.onTap,
+    required this.onLongPress,
   });
 
   @override
@@ -725,17 +877,22 @@ class _JadwalTileState extends State<_JadwalTile>
             padding: const EdgeInsets.only(bottom: 10),
             child: GestureDetector(
               onTapDown: (_) => setState(() => _isPressed = true),
-              onTapUp: (_) => setState(() => _isPressed = false),
+              onTapUp: (_) {
+                setState(() => _isPressed = false);
+                widget.onTap();
+              },
               onTapCancel: () => setState(() => _isPressed = false),
+              onLongPress: widget.onLongPress,
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 120),
                 transform: Matrix4.identity()..scale(_isPressed ? 0.98 : 1.0),
                 transformAlignment: Alignment.center,
                 decoration: BoxDecoration(
-                  color: _kWhite,
+                  color: widget.isSelected ? _kTeal.withOpacity(0.08) : _kWhite,
                   borderRadius: BorderRadius.circular(14),
                   border: Border.all(
-                    color: _isPressed ? _kTeal.withOpacity(0.3) : _kBorder,
+                    color: widget.isSelected ? _kTeal : (_isPressed ? _kTeal.withOpacity(0.3) : _kBorder),
+                    width: widget.isSelected ? 2 : 1,
                   ),
                   boxShadow: [
                     BoxShadow(
@@ -831,8 +988,25 @@ class _JadwalTileState extends State<_JadwalTile>
                         ),
                       ),
 
-                      // Tombol hapus
-                      _DeleteButton(onTap: widget.onHapus),
+                      // Tombol hapus atau Checkbox
+                      if (widget.isSelectionMode)
+                        Container(
+                          width: 26,
+                          height: 26,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: widget.isSelected ? _kTeal : Colors.transparent,
+                            border: Border.all(
+                              color: widget.isSelected ? _kTeal : _kBorder.withOpacity(0.8),
+                              width: 2,
+                            ),
+                          ),
+                          child: widget.isSelected
+                              ? const Icon(Icons.check_rounded, color: Colors.white, size: 16)
+                              : null,
+                        )
+                      else
+                        _DeleteButton(onTap: widget.onHapus),
                     ],
                   ),
                 ),
