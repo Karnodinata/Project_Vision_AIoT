@@ -110,10 +110,26 @@ def mulai_pakan():
 
 def hentikan_pakan():
     global status_servo_aktif, id_sesi_sekarang, status_ai_terakhir
+    
+    # Simpan ID sesi sebelum di-reset, agar bisa di-update ke database
+    id_sesi_yang_berhenti = id_sesi_sekarang
+    
     status_servo_aktif = False
     id_sesi_sekarang = None
     status_ai_terakhir = "STANDBY"
     mqtt_client.publish(TOPIC_KONTROL, '{"perintah_servo": "tutup"}')
+    
+    # --- UPDATE waktu_selesai ke tabel sesi_pakan ---
+    if id_sesi_yang_berhenti:
+        try:
+            supabase.table("sesi_pakan").update({
+                "waktu_selesai": datetime.now().isoformat()
+            }).eq("id_sesi", id_sesi_yang_berhenti).execute()
+            print(f"✅ [SUPABASE] waktu_selesai berhasil dicatat untuk sesi: {id_sesi_yang_berhenti}")
+        except Exception as e:
+            print(f"❌ [SUPABASE] Gagal mencatat waktu_selesai: {e}")
+    # -------------------------------------------------
+    
     print(">> PAKAN DIHENTIKAN")
 
 # ==============================================================================
