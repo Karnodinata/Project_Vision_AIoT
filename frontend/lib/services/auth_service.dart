@@ -3,6 +3,15 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 class AuthService {
   final SupabaseClient _supabase = Supabase.instance.client;
 
+  // Format username menjadi email jika belum memiliki suffix '@'
+  static String formatEmail(String rawInput) {
+    final clean = rawInput.trim();
+    if (!clean.contains('@') && clean.isNotEmpty) {
+      return '$clean@gmail.com';
+    }
+    return clean;
+  }
+
   // Fungsi Login Faktual
   Future<AuthResponse> login(String email, String password) async {
     try {

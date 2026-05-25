@@ -233,40 +233,46 @@ class _RiwayatScreenState extends State<RiwayatScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: _bgPage,
-      body: CustomScrollView(
-        physics: const BouncingScrollPhysics(),
-        slivers: [
-          _buildAppBar(),
-          SliverToBoxAdapter(child: _buildDatePickerBar()),
-          if (_isLoading)
-            const SliverFillRemaining(child: _LoadingState())
-          else if (_historyList.isEmpty)
-            const SliverFillRemaining(child: _EmptyState())
-          else
-            SliverPadding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
-              sliver: SliverList(
-                delegate: SliverChildBuilderDelegate(
-                  (context, index) => _AnimatedCard(
-                    index: index,
-                    controller: _listController,
-                    child: _DailyCard(
-                      dayData: _historyList[index],
+      body: RefreshIndicator(
+        onRefresh: () => _fetchDataFor10Days(_selectedDate),
+        color: _teal500,
+        backgroundColor: Colors.white,
+        displacement: 80,
+        child: CustomScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          slivers: [
+            _buildAppBar(),
+            SliverToBoxAdapter(child: _buildDatePickerBar()),
+            if (_isLoading)
+              const SliverFillRemaining(child: _LoadingState())
+            else if (_historyList.isEmpty)
+              const SliverFillRemaining(child: _EmptyState())
+            else
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
+                sliver: SliverList(
+                  delegate: SliverChildBuilderDelegate(
+                    (context, index) => _AnimatedCard(
                       index: index,
-                      onTap: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) =>
-                              RiwayatDetailScreen(dayData: _historyList[index]),
+                      controller: _listController,
+                      child: _DailyCard(
+                        dayData: _historyList[index],
+                        index: index,
+                        onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) =>
+                                RiwayatDetailScreen(dayData: _historyList[index]),
+                          ),
                         ),
                       ),
                     ),
+                    childCount: _historyList.length,
                   ),
-                  childCount: _historyList.length,
                 ),
               ),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }

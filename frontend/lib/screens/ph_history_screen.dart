@@ -155,7 +155,7 @@ class _PhHistoryScreenState extends State<PhHistoryScreen>
                   ),
                 ),
                 Text(
-                  'Rekam jejak 24 jam terakhir',
+                  'Rekam jejak 24 jam sesi terakhir',
                   style: TextStyle(
                     color: _textSecondary,
                     fontSize: 10,
@@ -258,21 +258,27 @@ class _PhHistoryScreenState extends State<PhHistoryScreen>
 
               return FadeTransition(
                 opacity: _fadeAnimation,
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.fromLTRB(16, 20, 16, 36),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _buildStatsRow(stats),
-                      const SizedBox(height: 16),
-                      _buildChartCard(
-                        chartSpots: chartSpots,
-                        reversedData: reversedDataForLabels,
-                        stats: stats,
-                      ),
-                      const SizedBox(height: 16),
-                      _buildLogTable(rawData),
-                    ],
+                child: RefreshIndicator(
+                  onRefresh: () async => setState(() {}),
+                  color: _accent,
+                  backgroundColor: Colors.white,
+                  child: SingleChildScrollView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.fromLTRB(16, 20, 16, 36),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _buildStatsRow(stats),
+                        const SizedBox(height: 16),
+                        _buildChartCard(
+                          chartSpots: chartSpots,
+                          reversedData: reversedDataForLabels,
+                          stats: stats,
+                        ),
+                        const SizedBox(height: 16),
+                        _buildLogTable(rawData),
+                      ],
+                    ),
                   ),
                 ),
               );

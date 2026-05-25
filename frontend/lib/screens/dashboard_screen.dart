@@ -1,13 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:fl_chart/fl_chart.dart';
 import 'package:intl/intl.dart';
-import 'package:http/http.dart' as http;
-
-import '../config.dart';
 import '../services/dashboard_service.dart';
 import '../services/auth_service.dart';
+import '../theme/app_theme.dart';
+import '../widgets/grid_painter.dart';
+import '../widgets/ph_realtime_card.dart';
+import '../widgets/telemetry_feeder_card.dart';
 import 'login_screen.dart';
 import 'ph_history_screen.dart';
 import 'feeding_history_screen.dart';
@@ -25,6 +25,15 @@ class _DashboardScreenState extends State<DashboardScreen>
     with TickerProviderStateMixin {
   final _dashboardService = DashboardService();
   final _authService = AuthService();
+
+  // ── Color Mapping for Central Theme ──
+  static const Color _kPrimary = AppColors.primary;
+  static const Color _kPrimaryDark = AppColors.primaryDark;
+  static const Color _kBgPage = AppColors.bgPage;
+  static const Color _kTextSecondary = AppColors.textSecondary;
+  static const Color _kWarning = AppColors.warning;
+  static const Color _kWarningDark = AppColors.warningDark;
+  static const Color _kError = AppColors.error;
 
   Map<String, dynamic>? _kolamInfo;
   bool _isLoading = true;
@@ -67,9 +76,15 @@ class _DashboardScreenState extends State<DashboardScreen>
     );
 
     _initDashboard();
+    _startPollingTimer();
+  }
 
-    // Global Polling Timer yang agresif untuk menarik status Servo & AI (Setiap 1 detik)
-    _globalPollingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+  void _startPollingTimer() {
+    _globalPollingTimer?.cancel();
+    final duration = _isWaitingForSatiated
+        ? const Duration(seconds: 1)
+        : const Duration(seconds: 15);
+    _globalPollingTimer = Timer.periodic(duration, (_) {
       if (mounted && _kolamInfo != null) {
         _sinkronisasiStatusRealtime(_kolamInfo!['id_kolam'] as int);
       }
@@ -95,9 +110,19 @@ class _DashboardScreenState extends State<DashboardScreen>
                 .streamRiwayatPh(info['id_kolam'] as int)
                 .asBroadcastStream();
           }
-          _isLoading = false;
         });
-        _fadeController.forward();
+        
+        // Panggil sinkronisasi pertama kali secara langsung agar data terisi instan
+        if (info != null) {
+          await _sinkronisasiStatusRealtime(info['id_kolam'] as int);
+        }
+        
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+          });
+          _fadeController.forward();
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -109,55 +134,62 @@ class _DashboardScreenState extends State<DashboardScreen>
     }
   }
 
+  // Pull-to-refresh handler
+  Future<void> _onRefresh() async {
+    if (_kolamInfo == null) return;
+    await _sinkronisasiStatusRealtime(_kolamInfo!['id_kolam'] as int);
+  }
+
   // FUNGSI BARU PENYELAMAT SINKRONISASI TOMBOL & AI
   Future<void> _sinkronisasiStatusRealtime(int idKolam) async {
     try {
-      final res = await http.get(Uri.parse('${AppConfig.baseUrl}/api/status'));
-      if (res.statusCode == 200) {
-        final data = json.decode(res.body);
-        bool isServoMenyala = data['status_servo_aktif'] ?? false;
-        String statusAi = data['status_ai_terakhir']?.toString() ?? '';
+      final data = await _dashboardService.getStatus();
+      bool isServoMenyala = data['status_servo_aktif'] ?? false;
+      String statusAi = data['status_ai_terakhir']?.toString() ?? '';
 
-        if (mounted) {
-          setState(() {
-            _telemetryData = data;
+      if (mounted) {
+        setState(() {
+          _telemetryData = data;
 
-            // JIKA SERVO MATI DI BACKEND TAPI TOMBOL MASIH ORANYE DI APLIKASI
-            if (!isServoMenyala && _isWaitingForSatiated) {
-              _isWaitingForSatiated = false;
-              _isSendingCommand = false;
+          // JIKA SERVO MATI DI BACKEND TAPI TOMBOL MASIH ORANYE DI APLIKASI
+          if (!isServoMenyala && _isWaitingForSatiated) {
+            _isWaitingForSatiated = false;
+            _isSendingCommand = false;
+            _startPollingTimer();
 
-              // Cek apakah mati otomatis karena AI (Ada kata 'kenyang')
-              if (statusAi.toLowerCase().contains('kenyang')) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: const Text(
-                      'AI: Pakan dihentikan, ikan sudah kenyang!',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                      ),
+            // Cek apakah mati otomatis karena AI (Ada kata 'kenyang')
+            if (statusAi.toLowerCase().contains('kenyang')) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: const Text(
+                    'AI: Pakan dihentikan, ikan sudah kenyang!',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
                     ),
-                    backgroundColor: const Color(0xFF009E83),
-                    behavior: SnackBarBehavior.floating,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    margin: const EdgeInsets.all(16),
                   ),
-                );
-              }
+                  backgroundColor: _kPrimary,
+                  behavior: SnackBarBehavior.floating,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  margin: const EdgeInsets.all(16),
+                ),
+              );
             }
+          }
 
-            // JIKA SERVO MENYALA DI BACKEND (KARENA JADWAL) TAPI TOMBOL UI MASIH MERAH
-            if (isServoMenyala && !_isWaitingForSatiated) {
-              _isWaitingForSatiated = true;
-              _isSendingCommand = false;
-            }
-          });
-        }
+          // JIKA SERVO MENYALA DI BACKEND (KARENA JADWAL) TAPI TOMBOL UI MASIH MERAH
+          if (isServoMenyala && !_isWaitingForSatiated) {
+            _isWaitingForSatiated = true;
+            _isSendingCommand = false;
+            _startPollingTimer();
+          }
+        });
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('Error sinkronisasiStatusRealtime: $e');
+    }
   }
 
   void _handleLogout() async {
@@ -176,8 +208,11 @@ class _DashboardScreenState extends State<DashboardScreen>
 
     try {
       await _dashboardService.triggerPakanManual();
-      // UI State akan otomatis diubah oleh _sinkronisasiStatusRealtime()
-      // Tidak perlu set _isWaitingForSatiated di sini lagi
+      setState(() {
+        _isSendingCommand = false;  // ← reset agar tombol langsung pindah ke state "HENTIKAN PAKAN"
+        _isWaitingForSatiated = true;
+        _startPollingTimer();
+      });
     } catch (e) {
       if (mounted) setState(() => _isSendingCommand = false);
     }
@@ -189,7 +224,11 @@ class _DashboardScreenState extends State<DashboardScreen>
 
     try {
       await _dashboardService.hentikanPakanManual();
-      // UI State akan otomatis diubah oleh _sinkronisasiStatusRealtime()
+      setState(() {
+        _isSendingCommand = false;  // ← reset agar tombol langsung kembali ke "BERI PAKAN MANUAL"
+        _isWaitingForSatiated = false;
+        _startPollingTimer();
+      });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -200,7 +239,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                 fontWeight: FontWeight.bold,
               ),
             ),
-            backgroundColor: const Color(0xFFD97706),
+            backgroundColor: _kWarningDark,
             behavior: SnackBarBehavior.floating,
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(8),
@@ -272,20 +311,20 @@ class _DashboardScreenState extends State<DashboardScreen>
   Widget build(BuildContext context) {
     if (_isLoading) {
       return const Scaffold(
-        backgroundColor: Color(0xFFF0F4F3),
+        backgroundColor: AppColors.bgPage,
         body: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               CircularProgressIndicator(
-                color: Color(0xFF009E83),
+                color: AppColors.primary,
                 strokeWidth: 2,
               ),
               SizedBox(height: 20),
               Text(
                 'MENGINISIALISASI SISTEM...',
                 style: TextStyle(
-                  color: Color(0xFF4A7A72),
+                  color: AppColors.textSecondary,
                   fontSize: 11,
                   letterSpacing: 3,
                 ),
@@ -298,7 +337,7 @@ class _DashboardScreenState extends State<DashboardScreen>
 
     if (_errorMessage.isNotEmpty) {
       return Scaffold(
-        backgroundColor: const Color(0xFFF0F4F3),
+        backgroundColor: _kBgPage,
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(32.0),
@@ -308,13 +347,13 @@ class _DashboardScreenState extends State<DashboardScreen>
                 const Icon(
                   Icons.signal_wifi_connected_no_internet_4,
                   size: 48,
-                  color: Color(0xFFE63946),
+                  color: AppColors.error,
                 ),
                 const SizedBox(height: 20),
                 const Text(
                   'KONEKSI GAGAL',
                   style: TextStyle(
-                    color: Color(0xFFE63946),
+                    color: AppColors.error,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
@@ -334,16 +373,22 @@ class _DashboardScreenState extends State<DashboardScreen>
     final namaKolam = _kolamInfo!['nama_kolam'] as String;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF0F4F3),
+      backgroundColor: _kBgPage,
       appBar: _buildAppBar(namaKolam),
       body: Stack(
         children: [
-          Positioned.fill(child: CustomPaint(painter: _GridPainter())),
+          const Positioned.fill(child: CustomPaint(painter: GridPainter())),
           FadeTransition(
             opacity: _fadeAnimation,
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
-              child: Column(
+            child: RefreshIndicator(
+              onRefresh: _onRefresh,
+              color: _kPrimary,
+              backgroundColor: Colors.white,
+              displacement: 50,
+              child: SingleChildScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
+                child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   StreamBuilder<List<Map<String, dynamic>>>(
@@ -359,15 +404,28 @@ class _DashboardScreenState extends State<DashboardScreen>
                     },
                   ),
                   const SizedBox(height: 20),
-                  _buildPhRealtimeSection(idKolam),
+                  PhRealtimeCard(
+                    phStream: _phStream,
+                    realtimePh: _telemetryData != null
+                        ? (_telemetryData!['tingkat_ph'] as num?)?.toDouble()
+                        : null,
+                    isIotAktif: _telemetryData != null
+                        ? (_telemetryData!['is_iot_aktif'] as bool? ?? false)
+                        : true,
+                    onTap: () => _bukaDetailPh(idKolam),
+                  ),
                   const SizedBox(height: 16),
-                  _buildTelemetrySection(idKolam),
+                  TelemetryFeederCard(
+                    telemetryData: _telemetryData,
+                    onTap: () => _bukaDetailTelemetri(idKolam),
+                  ),
                   const SizedBox(height: 16),
                   _buildFeedActionGroup(idKolam),
                 ],
               ),
             ),
           ),
+        ),
         ],
       ),
     );
@@ -383,11 +441,11 @@ class _DashboardScreenState extends State<DashboardScreen>
             width: 32,
             height: 32,
             decoration: BoxDecoration(
-              border: Border.all(color: const Color(0xFF009E83), width: 1),
+              border: Border.all(color: _kPrimary, width: 1),
               borderRadius: BorderRadius.circular(8),
-              color: const Color(0xFF009E83).withOpacity(0.10),
+              color: _kPrimary.withOpacity(0.10),
             ),
-            child: const Icon(Icons.water, color: Color(0xFF009E83), size: 16),
+            child: const Icon(Icons.water, color: _kPrimary, size: 16),
           ),
           const SizedBox(width: 12),
           Column(
@@ -395,7 +453,7 @@ class _DashboardScreenState extends State<DashboardScreen>
             children: [
               ShaderMask(
                 shaderCallback: (bounds) => const LinearGradient(
-                  colors: [Color(0xFF006B58), Color(0xFF009E83)],
+                  colors: [_kPrimaryDark, _kPrimary],
                 ).createShader(bounds),
                 child: const Text(
                   'V.I.S.I.O.N',
@@ -410,7 +468,7 @@ class _DashboardScreenState extends State<DashboardScreen>
               Text(
                 namaKolam.toUpperCase(),
                 style: const TextStyle(
-                  color: Color(0xFF4A7A72),
+                  color: _kTextSecondary,
                   fontSize: 10,
                   letterSpacing: 1.5,
                 ),
@@ -421,7 +479,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       ),
       actions: [
         IconButton(
-          icon: const Icon(Icons.logout_rounded, color: Color(0xFF4A7A72)),
+          icon: const Icon(Icons.logout_rounded, color: _kTextSecondary),
           onPressed: _handleLogout,
         ),
       ],
@@ -429,7 +487,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Widget _buildStatusHeader(bool isOnline) {
-    final color = isOnline ? const Color(0xFF009E83) : const Color(0xFFE63946);
+    final color = isOnline ? _kPrimary : _kError;
     final statusLabel = isOnline
         ? 'SISTEM KONTROL AKTIF & TERHUBUNG'
         : 'KONEKSI SENSOR TERPUTUS';
@@ -476,292 +534,7 @@ class _DashboardScreenState extends State<DashboardScreen>
     );
   }
 
-  Widget _buildPhRealtimeSection(int idKolam) {
-    return StreamBuilder<List<Map<String, dynamic>>>(
-      stream: _phStream,
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting)
-          return _buildLoadingCard('METRIK pH REAL-TIME');
-        if (snapshot.hasError || !snapshot.hasData || snapshot.data!.isEmpty) {
-          return _buildCardWrapper(
-            title: 'METRIK pH REAL-TIME',
-            icon: Icons.science_outlined,
-            child: const _EmptyDataWidget(
-              message: 'Belum ada data hidrologi masuk.',
-            ),
-          );
-        }
 
-        final data = snapshot.data!;
-        final latestPh = data.first['ph_level'] as num;
-
-        Color phColor = const Color(0xFF009E83);
-        String statusText = 'OPTIMAL';
-        String statusDesc = 'Kadar pH dalam rentang ideal 6.5 – 8.5';
-        if (latestPh < 6.5 || latestPh > 8.5) {
-          phColor = const Color(0xFFE63946);
-          statusText = 'PERINGATAN ANOMALI';
-          statusDesc = 'Kadar pH di luar rentang ideal!';
-        }
-
-        return _buildClickableCardWrapper(
-          title: 'METRIK pH REAL-TIME',
-          icon: Icons.science_outlined,
-          onTap: () => _bukaDetailPh(idKolam),
-          child: Column(
-            children: [
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  ShaderMask(
-                    shaderCallback: (bounds) => LinearGradient(
-                      colors: [phColor.withOpacity(0.75), phColor],
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                    ).createShader(bounds),
-                    child: Text(
-                      latestPh.toStringAsFixed(1),
-                      style: const TextStyle(
-                        fontSize: 72,
-                        fontWeight: FontWeight.w900,
-                        color: Colors.black,
-                        height: 1,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 16),
-                  Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 4,
-                            ),
-                            decoration: BoxDecoration(
-                              color: phColor.withOpacity(0.12),
-                              borderRadius: BorderRadius.circular(6),
-                              border: Border.all(
-                                color: phColor.withOpacity(0.35),
-                              ),
-                            ),
-                            child: Text(
-                              statusText,
-                              style: TextStyle(
-                                color: phColor,
-                                fontSize: 10,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            statusDesc,
-                            style: const TextStyle(
-                              color: Color(0xFF2E4F48),
-                              fontSize: 11,
-                              height: 1.4,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 20),
-              SizedBox(
-                height: 130,
-                child: LineChart(
-                  LineChartData(
-                    gridData: FlGridData(
-                      show: true,
-                      drawVerticalLine: false,
-                      getDrawingHorizontalLine: (_) => FlLine(
-                        color: const Color(0xFFD5E5E2),
-                        strokeWidth: 1,
-                        dashArray: [4, 4],
-                      ),
-                    ),
-                    titlesData: FlTitlesData(
-                      show: true,
-                      topTitles: const AxisTitles(
-                        sideTitles: SideTitles(showTitles: false),
-                      ),
-                      rightTitles: const AxisTitles(
-                        sideTitles: SideTitles(showTitles: false),
-                      ),
-                      bottomTitles: const AxisTitles(
-                        sideTitles: SideTitles(showTitles: false),
-                      ),
-                      leftTitles: AxisTitles(
-                        sideTitles: SideTitles(
-                          showTitles: true,
-                          reservedSize: 36,
-                          getTitlesWidget: (value, meta) {
-                            if (value == meta.max || value == meta.min)
-                              return const SizedBox.shrink();
-                            return Padding(
-                              padding: const EdgeInsets.only(right: 8.0),
-                              child: Text(
-                                value.toStringAsFixed(1),
-                                style: const TextStyle(
-                                  color: Color(0xFF4A7A72),
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                                textAlign: TextAlign.right,
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                    ),
-                    borderData: FlBorderData(show: false),
-                    lineBarsData: [
-                      LineChartBarData(
-                        spots: data
-                            .asMap()
-                            .entries
-                            .map(
-                              (e) => FlSpot(
-                                (data.length - 1 - e.key).toDouble(),
-                                (e.value['ph_level'] as num).toDouble(),
-                              ),
-                            )
-                            .toList(),
-                        isCurved: true,
-                        color: phColor,
-                        barWidth: 2.5,
-                        dotData: const FlDotData(show: false),
-                        belowBarData: BarAreaData(
-                          show: true,
-                          gradient: LinearGradient(
-                            begin: Alignment.topCenter,
-                            end: Alignment.bottomCenter,
-                            colors: [
-                              phColor.withOpacity(0.18),
-                              phColor.withOpacity(0.0),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildTelemetrySection(int idKolam) {
-    if (_telemetryData == null) {
-      return _buildLoadingCard('TELEMETRI FEEDER & AI');
-    }
-
-    final session = _telemetryData!;
-    final sisaPakan = session['persen_sisa_pakan'] ?? '--';
-    final statusAi = session['status_ai_terakhir'] ?? 'STANDBY';
-    final isServoAktif = session['status_servo_aktif'] ?? false;
-
-    double? sisaPakanNum;
-    if (sisaPakan != '--') sisaPakanNum = (sisaPakan as num).toDouble();
-    final pakanColor = sisaPakanNum != null && sisaPakanNum < 20
-        ? const Color(0xFFE63946)
-        : const Color(0xFF009E83);
-
-    return _buildClickableCardWrapper(
-      title: 'TELEMETRI FEEDER & AI',
-      icon: Icons.router_outlined,
-      onTap: () => _bukaDetailTelemetri(idKolam),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              AnimatedBuilder(
-                animation: _pulseAnimation,
-                builder: (context, _) => Container(
-                  width: 36,
-                  height: 36,
-                  decoration: BoxDecoration(
-                    color: isServoAktif
-                        ? const Color(
-                            0xFFE63946,
-                          ).withOpacity(0.1 + (_pulseAnimation.value * 0.2))
-                        : const Color(0xFFF5FAF9),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: isServoAktif
-                          ? const Color(0xFFE63946)
-                          : const Color(0xFFD5E5E2),
-                    ),
-                  ),
-                  child: Icon(
-                    isServoAktif ? Icons.camera : Icons.camera_alt_outlined,
-                    color: isServoAktif
-                        ? const Color(0xFFE63946)
-                        : const Color(0xFF4A7A72),
-                    size: 18,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              const Expanded(
-                child: Text(
-                  'Status ESP32-CAM',
-                  style: TextStyle(color: Color(0xFF2E4F48), fontSize: 13),
-                ),
-              ),
-              isServoAktif
-                  ? AnimatedBuilder(
-                      animation: _pulseAnimation,
-                      builder: (context, _) => Opacity(
-                        opacity: 0.5 + (_pulseAnimation.value * 0.5),
-                        child: const Text(
-                          '🔴 MEREKAM...',
-                          style: TextStyle(
-                            color: Color(0xFFE63946),
-                            fontSize: 13,
-                            fontWeight: FontWeight.bold,
-                            letterSpacing: 1,
-                          ),
-                        ),
-                      ),
-                    )
-                  : const Text(
-                      '⚪ STANDBY',
-                      style: TextStyle(
-                        color: Color(0xFF4A7A72),
-                        fontSize: 13,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-            ],
-          ),
-          _buildDivider(),
-          _buildTelemetryRow(
-            icon: Icons.auto_awesome,
-            label: 'Hasil Analisis AI',
-            value: statusAi.toString().toUpperCase(),
-            valueColor: const Color(0xFF0D1F1B),
-          ),
-          _buildDivider(),
-          _buildTelemetryRow(
-            icon: Icons.inventory_2_outlined,
-            label: 'Sisa Pakan Dispenser',
-            value: '$sisaPakan%',
-            valueColor: pakanColor,
-          ),
-        ],
-      ),
-    );
-  }
 
   Widget _buildFeedActionGroup(int idKolam) {
     return Column(
@@ -775,7 +548,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                 width: 3,
                 height: 14,
                 decoration: BoxDecoration(
-                  color: const Color(0xFF009E83),
+                  color: _kPrimary,
                   borderRadius: BorderRadius.circular(2),
                 ),
               ),
@@ -783,7 +556,7 @@ class _DashboardScreenState extends State<DashboardScreen>
               const Text(
                 'KENDALI PAKAN',
                 style: TextStyle(
-                  color: Color(0xFF009E83),
+                  color: _kPrimary,
                   fontSize: 11,
                   letterSpacing: 2,
                   fontWeight: FontWeight.w700,
@@ -814,23 +587,23 @@ class _DashboardScreenState extends State<DashboardScreen>
 
     if (isSending) {
       btnText = 'MENGIRIM KOMANDO...';
-      btnGradient = [const Color(0xFFE8F2F0), const Color(0xFFE8F2F0)];
-      btnBorder = const Color(0xFFD5E5E2);
+      btnGradient = [AppColors.primaryLight, AppColors.primaryLight];
+      btnBorder = AppColors.primaryBorder;
       btnShadow = Colors.transparent;
       btnIcon = Icons.hourglass_empty;
       onTapAction = null;
     } else if (isRunning) {
       btnText = '🛑 HENTIKAN PAKAN (OVERRIDE)';
-      btnGradient = [const Color(0xFFF59E0B), const Color(0xFFD97706)];
-      btnBorder = const Color(0xFFF59E0B).withOpacity(0.5);
-      btnShadow = const Color(0xFFD97706).withOpacity(0.3);
+      btnGradient = [_kWarning, _kWarningDark];
+      btnBorder = _kWarning.withOpacity(0.5);
+      btnShadow = _kWarningDark.withOpacity(0.3);
       btnIcon = Icons.stop_circle_outlined;
       onTapAction = () => _hentikanPakanManual(idKolam);
     } else {
       btnText = 'BERI PAKAN MANUAL';
-      btnGradient = [const Color(0xFFE63946), const Color(0xFFD62828)];
-      btnBorder = const Color(0xFFE63946).withOpacity(0.5);
-      btnShadow = const Color(0xFFE63946).withOpacity(0.28);
+      btnGradient = [_kError, const Color(0xFFD62828)];
+      btnBorder = _kError.withOpacity(0.5);
+      btnShadow = _kError.withOpacity(0.28);
       btnIcon = Icons.power_settings_new_rounded;
       onTapAction = () => _eksekusiPakanManual(idKolam);
     }
@@ -867,7 +640,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                   width: 18,
                   height: 18,
                   child: CircularProgressIndicator(
-                    color: Color(0xFF4A7A72),
+                    color: AppColors.textSecondary,
                     strokeWidth: 2,
                   ),
                 )
@@ -877,7 +650,7 @@ class _DashboardScreenState extends State<DashboardScreen>
               Text(
                 btnText,
                 style: TextStyle(
-                  color: isSending ? const Color(0xFF2E4F48) : Colors.white,
+                  color: isSending ? AppColors.textDark : Colors.white,
                   fontSize: 12,
                   fontWeight: FontWeight.w800,
                   letterSpacing: 1.8,
@@ -900,7 +673,7 @@ class _DashboardScreenState extends State<DashboardScreen>
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: const Color(0xFF009E83).withOpacity(0.3)),
+          border: Border.all(color: _kPrimary.withOpacity(0.3)),
           boxShadow: const [
             BoxShadow(
               color: Color(0x14009E83),
@@ -923,7 +696,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                 ),
                 child: const Icon(
                   Icons.history,
-                  color: Color(0xFF009E83),
+                  color: _kPrimary,
                   size: 16,
                 ),
               ),
@@ -936,7 +709,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                     Text(
                       'RIWAYAT HARIAN',
                       style: TextStyle(
-                        color: Color(0xFF009E83),
+                        color: _kPrimary,
                         fontSize: 12,
                         fontWeight: FontWeight.w800,
                         letterSpacing: 1.5,
@@ -946,7 +719,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                     Text(
                       'Lihat data pH, pakan, & riwayat feeder',
                       style: TextStyle(
-                        color: Color(0xFF4A7A72),
+                        color: _kTextSecondary,
                         fontSize: 10,
                       ),
                     ),
@@ -955,7 +728,7 @@ class _DashboardScreenState extends State<DashboardScreen>
               ),
               const Icon(
                 Icons.arrow_forward_ios_rounded,
-                color: Color(0xFF009E83),
+                color: _kPrimary,
                 size: 14,
               ),
             ],
@@ -965,171 +738,7 @@ class _DashboardScreenState extends State<DashboardScreen>
     );
   }
 
-  Widget _buildDivider() => Container(
-    margin: const EdgeInsets.symmetric(vertical: 12),
-    height: 1,
-    color: const Color(0xFFD5E5E2),
-  );
 
-  Widget _buildTelemetryRow({
-    required IconData icon,
-    required String label,
-    required String value,
-    Color? valueColor,
-  }) {
-    return Row(
-      children: [
-        Container(
-          width: 36,
-          height: 36,
-          decoration: BoxDecoration(
-            color: const Color(0xFFF5FAF9),
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: const Color(0xFFD5E5E2)),
-          ),
-          child: Icon(icon, color: const Color(0xFF4A7A72), size: 18),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Text(
-            label,
-            style: const TextStyle(color: Color(0xFF2E4F48), fontSize: 13),
-          ),
-        ),
-        Text(
-          value,
-          style: TextStyle(
-            color: valueColor ?? const Color(0xFF0D1F1B),
-            fontSize: 13,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildLoadingCard(String title) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFFD5E5E2)),
-      ),
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        children: [
-          _buildCardHeader(title: title, icon: Icons.hourglass_empty_rounded),
-          const SizedBox(height: 24),
-          const SizedBox(
-            height: 22,
-            width: 22,
-            child: CircularProgressIndicator(
-              color: Color(0xFF009E83),
-              strokeWidth: 2,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCardWrapper({
-    required String title,
-    required IconData icon,
-    required Widget child,
-  }) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFFD5E5E2)),
-      ),
-      padding: const EdgeInsets.all(20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _buildCardHeader(title: title, icon: icon),
-          const SizedBox(height: 24),
-          child,
-        ],
-      ),
-    );
-  }
-
-  Widget _buildClickableCardWrapper({
-    required String title,
-    required IconData icon,
-    required VoidCallback onTap,
-    required Widget child,
-  }) {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(16),
-        child: Ink(
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: const Color(0xFFD5E5E2)),
-          ),
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  _buildCardHeader(title: title, icon: icon),
-                  Container(
-                    width: 28,
-                    height: 28,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFF5FAF9),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: const Color(0xFFD5E5E2)),
-                    ),
-                    child: const Icon(
-                      Icons.arrow_forward_ios_rounded,
-                      color: Color(0xFF4A7A72),
-                      size: 12,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 24),
-              child,
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildCardHeader({required String title, required IconData icon}) {
-    return Row(
-      children: [
-        Container(
-          width: 3,
-          height: 16,
-          decoration: BoxDecoration(
-            color: const Color(0xFF009E83),
-            borderRadius: BorderRadius.circular(2),
-          ),
-        ),
-        const SizedBox(width: 10),
-        Text(
-          title,
-          style: const TextStyle(
-            color: Color(0xFF009E83),
-            fontSize: 11,
-            letterSpacing: 2,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-      ],
-    );
-  }
 }
 
 class _JadwalButton extends StatefulWidget {
@@ -1186,9 +795,7 @@ class _JadwalButtonState extends State<_JadwalButton>
               color: Colors.white,
               borderRadius: BorderRadius.circular(12),
               border: Border.all(
-                color: const Color(
-                  0xFF009E83,
-                ).withOpacity(0.3 + _ctrl.value * 0.4),
+                color: AppColors.primary.withOpacity(0.3 + _ctrl.value * 0.4),
               ),
               boxShadow: const [
                 BoxShadow(
@@ -1212,7 +819,7 @@ class _JadwalButtonState extends State<_JadwalButton>
                     ),
                     child: const Icon(
                       Icons.schedule_rounded,
-                      color: Color(0xFF009E83),
+                      color: AppColors.primary,
                       size: 16,
                     ),
                   ),
@@ -1225,7 +832,7 @@ class _JadwalButtonState extends State<_JadwalButton>
                         Text(
                           'ATUR JADWAL OTOMATIS',
                           style: TextStyle(
-                            color: Color(0xFF009E83),
+                            color: AppColors.primary,
                             fontSize: 12,
                             fontWeight: FontWeight.w800,
                             letterSpacing: 1.5,
@@ -1235,7 +842,7 @@ class _JadwalButtonState extends State<_JadwalButton>
                         Text(
                           'Kelola waktu pemberian pakan terjadwal',
                           style: TextStyle(
-                            color: Color(0xFF4A7A72),
+                            color: AppColors.textSecondary,
                             fontSize: 10,
                           ),
                         ),
@@ -1246,7 +853,7 @@ class _JadwalButtonState extends State<_JadwalButton>
                     offset: Offset(_arrowSlide.value, 0),
                     child: const Icon(
                       Icons.arrow_forward_ios_rounded,
-                      color: Color(0xFF009E83),
+                      color: AppColors.primary,
                       size: 14,
                     ),
                   ),
@@ -1260,36 +867,4 @@ class _JadwalButtonState extends State<_JadwalButton>
   }
 }
 
-class _EmptyDataWidget extends StatelessWidget {
-  final String message;
-  const _EmptyDataWidget({required this.message});
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      children: [
-        const Icon(Icons.inbox_outlined, color: Color(0xFF4A7A72), size: 18),
-        const SizedBox(width: 10),
-        Text(
-          message,
-          style: const TextStyle(color: Color(0xFF2E4F48), fontSize: 13),
-        ),
-      ],
-    );
-  }
-}
 
-class _GridPainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = const Color(0xFF009E83).withOpacity(0.05)
-      ..strokeWidth = 1;
-    for (double x = 0; x < size.width; x += 40)
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
-    for (double y = 0; y < size.height; y += 40)
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../services/auth_service.dart';
+import '../theme/app_theme.dart';
 import 'dashboard_screen.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -18,18 +19,18 @@ class _LoginScreenState extends State<LoginScreen>
   bool _isLoading = false;
   bool _isObscure = true;
 
-  // ── Light Theme Color Palette ──────────────────────────────────────────────
-  static const _bgPage      = Color(0xFFF4F7FA);
-  static const _bgCard      = Color(0xFFFFFFFF);
-  static const _bgInput     = Color(0xFFF8FAFB);
-  static const _accent      = Color(0xFF0891B2);
-  static const _accentDark  = Color(0xFF0E7490);
-  static const _accentLight = Color(0xFFE0F2FE);
-  static const _borderColor = Color(0xFFE2E8F0);
-  static const _borderFocus = Color(0xFF0891B2);
-  static const _textPrimary = Color(0xFF0F172A);
-  static const _textSecondary = Color(0xFF64748B);
-  static const _textMuted   = Color(0xFFCBD5E1);
+  // Colors mapped to AppColors
+  static const _bgPage      = AppColors.bgLogin;
+  static const _bgCard      = AppColors.bgCard;
+  static const _bgInput     = AppColors.bgInput;
+  static const _accent      = AppColors.accent;
+  static const _accentDark  = AppColors.accentDark;
+  static const _accentLight = AppColors.accentLight;
+  static const _borderColor = AppColors.accentBorder;
+  static const _borderFocus = AppColors.accentFocus;
+  static const _textPrimary = AppColors.textPrimary;
+  static const _textSecondary = AppColors.textSecondaryLogin;
+  static const _textMuted   = AppColors.textMuted;
 
   late AnimationController _fadeController;
   late AnimationController _scanController;
@@ -99,10 +100,7 @@ class _LoginScreenState extends State<LoginScreen>
       return;
     }
 
-    String finalEmail = rawEmail;
-    if (!rawEmail.contains('@')) {
-      finalEmail = '$rawEmail@gmail.com';
-    }
+    final String finalEmail = AuthService.formatEmail(rawEmail);
 
     setState(() => _isLoading = true);
 

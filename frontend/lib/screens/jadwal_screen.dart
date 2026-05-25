@@ -1,23 +1,24 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
-import 'dart:convert';
-import '../config.dart'; // <-- Tambahkan baris ini
+
+import '../services/jadwal_service.dart';
+import '../theme/app_theme.dart';
+import '../widgets/grid_painter.dart';
 
 // ---------------------------------------------------------------------------
 // Warna konstanta — sama persis dengan DashboardScreen
 // ---------------------------------------------------------------------------
-const _kBg = Color(0xFFF0F4F3);
+const _kBg = AppColors.bgPage;
 const _kWhite = Colors.white;
-const _kTeal = Color(0xFF009E83);
-const _kTealDeep = Color(0xFF006B58);
+const _kTeal = AppColors.primary;
+const _kTealDeep = AppColors.primaryDark;
 const _kBorder = Color(0xFFD5E5E2);
 const _kSurface = Color(0xFFF5FAF9);
-const _kRed = Color(0xFFE63946);
-const _kTextPri = Color(0xFF0D1F1B);
+const _kRed = AppColors.error;
+const _kTextPri = AppColors.textPrimary;
 const _kTextSec = Color(0xFF2E4F48);
-const _kTextTer = Color(0xFF4A7A72);
+const _kTextTer = AppColors.textSecondary;
 const _kTextMuted = Color(0xFF6A9E97);
 
 // ---------------------------------------------------------------------------
@@ -32,8 +33,7 @@ class JadwalScreen extends StatefulWidget {
 
 class _JadwalScreenState extends State<JadwalScreen>
     with TickerProviderStateMixin {
-  // final String baseUrl = "http://192.168.1.17:5001/api/jadwal";
-  final String baseUrl = "${AppConfig.baseUrl}/api/jadwal";
+  final _jadwalService = JadwalService();
   
   List daftarJadwal = [];
   bool isLoading = false;
@@ -100,11 +100,9 @@ class _JadwalScreenState extends State<JadwalScreen>
   Future<void> fetchJadwal() async {
     setState(() => isLoading = true);
     try {
-      final response = await http.get(Uri.parse(baseUrl));
-      if (response.statusCode == 200) {
-        setState(() => daftarJadwal = json.decode(response.body));
-        _fadeCtrl.forward(from: 0);
-      }
+      final data = await _jadwalService.fetchJadwal();
+      setState(() => daftarJadwal = data);
+      _fadeCtrl.forward(from: 0);
     } catch (e) {
       debugPrint("Error Fetch: $e");
     } finally {
@@ -128,20 +126,15 @@ class _JadwalScreenState extends State<JadwalScreen>
     }
 
     try {
-      final response = await http.post(
-        Uri.parse(baseUrl),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({"jam": jam, "menit": menit}),
-      );
-      
+      await _jadwalService.tambahJadwal(jam, menit);
       if (!mounted) return;
-      
-      if (response.statusCode == 201) {
-        fetchJadwal();
-      } else if (response.statusCode == 409) {
+      fetchJadwal();
+    } catch (e) {
+      debugPrint("Error Add: $e");
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: const Text("Gagal: Jadwal sudah ada di server!"),
+            content: Text("Gagal menambah jadwal: ${e.toString().replaceAll('Exception: ', '')}"),
             backgroundColor: _kRed,
             behavior: SnackBarBehavior.floating,
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
@@ -149,17 +142,13 @@ class _JadwalScreenState extends State<JadwalScreen>
           ),
         );
       }
-    } catch (e) {
-      debugPrint("Error Add: $e");
     }
   }
 
   Future<void> hapusJadwal(int id) async {
     try {
-      final response = await http.delete(Uri.parse("$baseUrl?id=$id"));
-      if (response.statusCode == 200) {
-        fetchJadwal();
-      }
+      await _jadwalService.hapusJadwal(id);
+      fetchJadwal();
     } catch (e) {
       debugPrint("Error Delete: $e");
     }
@@ -168,25 +157,22 @@ class _JadwalScreenState extends State<JadwalScreen>
   Future<void> hapusSemuaJadwal() async {
     if (selectedIds.isEmpty) return;
     try {
-      final idsParam = selectedIds.join(',');
-      final response = await http.delete(Uri.parse("$baseUrl?ids=$idsParam"));
-      if (response.statusCode == 200) {
-        setState(() {
-          isSelectionMode = false;
-          selectedIds.clear();
-        });
-        fetchJadwal();
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Text("Jadwal terpilih berhasil dihapus!"),
-              backgroundColor: _kTeal,
-              behavior: SnackBarBehavior.floating,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-              margin: const EdgeInsets.all(16),
-            ),
-          );
-        }
+      await _jadwalService.hapusSemuaJadwal(selectedIds);
+      setState(() {
+        isSelectionMode = false;
+        selectedIds.clear();
+      });
+      fetchJadwal();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text("Jadwal terpilih berhasil dihapus!"),
+            backgroundColor: _kTeal,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            margin: const EdgeInsets.all(16),
+          ),
+        );
       }
     } catch (e) {
       debugPrint("Error Delete Batch: $e");
@@ -321,7 +307,7 @@ class _JadwalScreenState extends State<JadwalScreen>
       body: Stack(
         children: [
           // Grid background
-          Positioned.fill(child: CustomPaint(painter: _GridPainter())),
+          Positioned.fill(child: CustomPaint(painter: const GridPainter())),
           _buildBody(),
         ],
       ),
@@ -547,46 +533,52 @@ class _JadwalScreenState extends State<JadwalScreen>
   }
 
   Widget _buildJadwalList() {
-    return FadeTransition(
-      opacity: _fadeAnim,
-      child: ListView.builder(
-        padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
-        itemCount: daftarJadwal.length + 1, // +1 untuk summary card
-        itemBuilder: (context, index) {
-          if (index == 0) {
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 16),
-              child: _buildSummaryCard(),
-            );
-          }
-          final item = daftarJadwal[index - 1];
-          final label =
-              "${item['jam'].toString().padLeft(2, '0')}:${item['menit'].toString().padLeft(2, '0')}";
+    return RefreshIndicator(
+      onRefresh: fetchJadwal,
+      color: _kTeal,
+      backgroundColor: Colors.white,
+      child: FadeTransition(
+        opacity: _fadeAnim,
+        child: ListView.builder(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
+          itemCount: daftarJadwal.length + 1, // +1 untuk summary card
+          itemBuilder: (context, index) {
+            if (index == 0) {
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 16),
+                child: _buildSummaryCard(),
+              );
+            }
+            final item = daftarJadwal[index - 1];
+            final label =
+                "${item['jam'].toString().padLeft(2, '0')}:${item['menit'].toString().padLeft(2, '0')}";
 
-          return _JadwalTile(
-            jam: item['jam'],
-            menit: item['menit'],
-            label: label,
-            entryIndex: index - 1,
-            isSelected: selectedIds.contains(item['id']),
-            isSelectionMode: isSelectionMode,
-            onTap: () {
-              if (isSelectionMode) {
-                toggleSelection(item['id']);
-              }
-            },
-            onLongPress: () {
-              if (!isSelectionMode) {
-                setState(() {
-                  isSelectionMode = true;
-                  selectedIds.add(item['id']);
-                });
-                HapticFeedback.mediumImpact();
-              }
-            },
-            onHapus: () => _konfirmasiHapus(item['id'], label),
-          );
-        },
+            return _JadwalTile(
+              jam: item['jam'],
+              menit: item['menit'],
+              label: label,
+              entryIndex: index - 1,
+              isSelected: selectedIds.contains(item['id']),
+              isSelectionMode: isSelectionMode,
+              onTap: () {
+                if (isSelectionMode) {
+                  toggleSelection(item['id']);
+                }
+              },
+              onLongPress: () {
+                if (!isSelectionMode) {
+                  setState(() {
+                    isSelectionMode = true;
+                    selectedIds.add(item['id']);
+                  });
+                  HapticFeedback.mediumImpact();
+                }
+              },
+              onHapus: () => _konfirmasiHapus(item['id'], label),
+            );
+          },
+        ),
       ),
     );
   }
@@ -1492,22 +1484,4 @@ class _ShimmerBoxState extends State<_ShimmerBox>
   );
 }
 
-/// Grid background
-class _GridPainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = _kTeal.withOpacity(0.05)
-      ..strokeWidth = 1;
-    const spacing = 40.0;
-    for (double x = 0; x < size.width; x += spacing) {
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
-    }
-    for (double y = 0; y < size.height; y += spacing) {
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
-    }
-  }
 
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}

@@ -44,6 +44,7 @@ daftar_jadwal = []
 id_jadwal_counter = 1
 
 data_sensor_terakhir = {"jarak_cm": 20.0, "ph_level": 7.0}
+waktu_sensor_terakhir = None
 
 id_sesi_sekarang = None
 status_ai_terakhir = "STANDBY"
@@ -64,12 +65,13 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe(TOPIC_SENSOR)
 
 def on_message(client, userdata, msg):
-    global data_sensor_terakhir
+    global data_sensor_terakhir, waktu_sensor_terakhir
     try:
         if msg.topic == TOPIC_SENSOR:
             payload = json.loads(msg.payload.decode('utf-8'))
             data_sensor_terakhir["jarak_cm"] = payload.get("jarak_cm", 20.0)
             data_sensor_terakhir["ph_level"] = payload.get("ph_level", 7.0)
+            waktu_sensor_terakhir = datetime.now()
     except Exception as e:
         pass
 
@@ -129,19 +131,60 @@ def cek_dan_eksekusi_jadwal():
     else:
         menit_jadwal_terakhir = -1
 
+def simpan_riwayat_ph_ke_supabase():
+    global waktu_sensor_terakhir
+    try:
+        # Jangan simpan jika IoT offline / belum pernah mengirim data
+        is_iot_aktif = False
+        if waktu_sensor_terakhir is not None:
+            selisih = (datetime.now() - waktu_sensor_terakhir).total_seconds()
+            if selisih < 30:
+                is_iot_aktif = True
+                
+        if not is_iot_aktif:
+            print("⚠️ [SUPABASE] Batal menyimpan riwayat pH berkala karena sensor IoT offline.")
+            return
+
+        # Ambil id_kolam pertama dari database (default 1 jika kosong)
+        id_kolam = 1
+        res_kolam = supabase.table("kolam").select("id_kolam").limit(1).execute()
+        if res_kolam.data:
+            id_kolam = res_kolam.data[0]["id_kolam"]
+            
+        ph = round(data_sensor_terakhir["ph_level"], 2)
+        data_insert = {
+            "id_kolam": id_kolam,
+            "ph_level": ph,
+            "waktu_rekam": datetime.now().isoformat()
+        }
+        supabase.table("riwayat_ph").insert(data_insert).execute()
+        print(f"✅ [SUPABASE] Berhasil menyimpan riwayat pH berkala: {ph} (Kolam ID: {id_kolam})")
+    except Exception as e:
+        print(f"❌ [SUPABASE] Gagal menyimpan riwayat pH berkala: {e}")
+
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=cek_dan_eksekusi_jadwal, trigger="interval", seconds=10)
+scheduler.add_job(func=simpan_riwayat_ph_ke_supabase, trigger="interval", minutes=30)
 scheduler.start()
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
+    global waktu_sensor_terakhir
+    
+    is_iot_aktif = False
+    if waktu_sensor_terakhir is not None:
+        selisih = (datetime.now() - waktu_sensor_terakhir).total_seconds()
+        if selisih < 30:
+            is_iot_aktif = True
+
     ph = round(data_sensor_terakhir["ph_level"], 2)
     kualitas = "Peringatan Anomali" if ph < 6.5 or ph > 8.5 else "Optimal"
     
     return jsonify({
-        "tingkat_ph": ph,
-        "kualitas_air": kualitas,
-        "persen_sisa_pakan": hitung_persentase_pakan(data_sensor_terakhir["jarak_cm"]),
+        "tingkat_ph": ph if is_iot_aktif else None,
+        "kualitas_air": kualitas if is_iot_aktif else "Offline",
+        "is_iot_aktif": is_iot_aktif,
+        "persen_sisa_pakan": hitung_persentase_pakan(data_sensor_terakhir["jarak_cm"]) if is_iot_aktif else 0,
         "status_servo_aktif": status_servo_aktif,
         "status_ai_terakhir": status_ai_terakhir,
         "id_sesi_aktif": id_sesi_sekarang,

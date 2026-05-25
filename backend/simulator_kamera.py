@@ -3,12 +3,7 @@ import requests
 import time
 import threading
 
-# =====================================================================
-# KONFIGURASI
-# =====================================================================
-# 1. Ganti dengan IP dari aplikasi IP Webcam di HP kamu
-#    (Biasanya berakhiran /video)
-URL_KAMERA_HP = "http://10.62.8.45:8080/video"
+URL_KAMERA_HP = "http://10.168.218.125:8080/video"
 
 # 2. URL Backend Flask kamu
 URL_BACKEND = "http://127.0.0.1:5001/api/prediksi-kamera"
