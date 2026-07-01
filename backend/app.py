@@ -29,7 +29,7 @@ ROBOFLOW_CLIENT = InferenceHTTPClient(
     api_key="hX1iQ1FK8QVJOV1ksVE4"
 )
 WORKSPACE_NAME = "ai-lele"
-WORKFLOW_ID = "detect-and-classify"
+WORKFLOW_ID = "detect-and-classify-3"
 CLASS_IKAN_KENYANG = "ikan kenyang" 
 
 # --- KONFIGURASI SUPABASE ---
