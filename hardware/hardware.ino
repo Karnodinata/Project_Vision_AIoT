@@ -8,7 +8,7 @@
 // ==============================================================================
 // 1. KONFIGURASI JARINGAN & MQTT
 // ==============================================================================
-const char* ssid     = "Android"; // Sesuaikan dengan WiFi kamu
+const char* ssid     = "Android"; // Sesuaikan dengan WiFi Anda
 const char* password = "11221122";
 const char* mqtt_broker = "broker.emqx.io";
 const int mqtt_port = 1883;
@@ -21,7 +21,6 @@ const char* topic_kontrol = "visio/bioflok/kontrol";
 // ==============================================================================
 const int pinServo = 19;
 const int pinPH = 35;
-// VL53L0X otomatis menggunakan pin SDA (21) dan SCL (22) bawaan ESP32.
 
 // ==============================================================================
 // 3. OBJEK & VARIABEL GLOBAL
@@ -29,49 +28,40 @@ const int pinPH = 35;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 Servo servoPakan;
-Adafruit_VL53L0X lox = Adafruit_VL53L0X(); // Objek sensor laser
+Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 
 float phGlobal = 7.0;
 float jarakGlobal = 20.0;
 unsigned long timerSensor = 0;
+bool statusLaserOK = false; // Pengaman status sensor laser
 
-// --- Variabel Interval Servo ---
 bool statusPakanAktif = false;   
 bool posisiServoTerbuka = false; 
 unsigned long timerIntervalServo = 0; 
 
 const int SUDUT_BUKA = 90;
 const int SUDUT_TUTUP = 0;
-const unsigned long DURASI_BUKA = 700;  // 0,7 Detik
-const unsigned long DURASI_TUTUP = 10000; // 10 Detik
+const unsigned long DURASI_BUKA = 700;  
+const unsigned long DURASI_TUTUP = 10000; 
 
 // ==============================================================================
-// 4. FUNGSI PEMBACAAN SENSOR LASER VL53L0X (MODE DEBUGGING)
+// 4. FUNGSI PEMBACAAN SENSOR LASER
 // ==============================================================================
 float bacaJarakLaser() {
+  if (!statusLaserOK) return 20.0; // Jangan paksa baca jika sensor mati/kabel putus
+
   VL53L0X_RangingMeasurementData_t measure;
-  lox.rangingTest(&measure, false); // Minta sensor menembakkan laser 1x
+  lox.rangingTest(&measure, false);
 
   Serial.print(">>> DEBUG SENSOR LASER | ");
-
-  // RangeStatus = 4 artinya benda terlalu jauh / tidak ada pantulan
   if (measure.RangeStatus != 4) {
     float jarakCm = measure.RangeMilliMeter / 10.0;
-    
-    // Cetak hasil mentah ke Serial Monitor
     Serial.print("Jarak Mentah: ");
     Serial.print(measure.RangeMilliMeter);
-    Serial.print(" mm (");
-    Serial.print(jarakCm);
-    Serial.println(" cm)");
-    
-    // Fitur Clamping dimatikan sementara agar Anda bisa melihat nilai aslinya
-    // if (jarakCm > 20.0) return 20.0;
-    // if (jarakCm < 2.0) return 2.0;
-    
+    Serial.println(" mm");
     return jarakCm;
   } else {
-    Serial.println("Out of Range (Tidak ada pantulan / Terlalu Jauh)");
+    Serial.println("Out of Range (Tidak ada pantulan)");
     return 20.0;
   }
 }
@@ -108,16 +98,16 @@ void hubungkanMQTT() {
 }
 
 void callbackMQTT(char* topic, byte* payload, unsigned int length) {
-  String pesan = "";
-  for (int i = 0; i < length; i++) {
-    pesan += (char)payload[i];
-  }
+  // Cara yang lebih aman untuk mencegah kebocoran memori (Memory Leak)
+  char pesan[length + 1];
+  memcpy(pesan, payload, length);
+  pesan[length] = '\0';
   
   StaticJsonDocument<200> doc;
   DeserializationError error = deserializeJson(doc, pesan);
   
   if (!error) {
-    String perintah = doc["perintah_servo"];
+    String perintah = doc["perintah_servo"].as<String>();
     if (perintah == "buka") {
       statusPakanAktif = true;
       posisiServoTerbuka = true;
@@ -133,23 +123,21 @@ void callbackMQTT(char* topic, byte* payload, unsigned int length) {
 }
 
 // ==============================================================================
-// 6. FUNGSI UTAMA (SETUP & LOOP)
+// 6. FUNGSI UTAMA
 // ==============================================================================
 void setup() {
   Serial.begin(115200);
-  
-  // Inisialisasi jalur I2C
   Wire.begin();
   
-  // Inisialisasi Sensor VL53L0X
-  Serial.println("Mencari sensor VL53L0X...");
+  Serial.println("\n--- INISIALISASI HARDWARE ---");
   if (!lox.begin()) {
-    Serial.println("Gagal menemukan VL53L0X! Cek kabel SDA (21) dan SCL (22).");
+    Serial.println("❌ Gagal menemukan VL53L0X! Cek kabel SDA (21) dan SCL (22).");
+    statusLaserOK = false;
   } else {
-    Serial.println("Sensor VL53L0X siap bekerja!");
+    Serial.println("✅ Sensor VL53L0X siap bekerja!");
+    statusLaserOK = true;
   }
 
-  // Inisialisasi Servo
   servoPakan.setPeriodHertz(50);
   servoPakan.attach(pinServo, 500, 2400);
   servoPakan.write(SUDUT_TUTUP); 
@@ -184,14 +172,12 @@ void loop() {
     }
   }
 
-  // Kirim data sensor setiap 2 Detik
-  if (millis() - timerSensor > 2000) {
+  // INTERVAL DIUBAH KE 5 DETIK AGAR TIDAK DIBLOKIR BROKER
+  if (millis() - timerSensor > 5000) {
     timerSensor = millis();
 
-    // 1. Baca Jarak dengan Laser
     jarakGlobal = bacaJarakLaser();
 
-    // 2. Baca pH
     long totalAnalog = 0;
     for(int i = 0; i < 10; i++) {
       totalAnalog += analogRead(pinPH);
@@ -204,13 +190,17 @@ void loop() {
     if (phGlobal > 14.0) phGlobal = 14.0;
     if (phGlobal < 0.0) phGlobal = 0.0;
 
-    // 3. Kirim ke MQTT
     StaticJsonDocument<200> doc;
     doc["jarak_cm"] = jarakGlobal;
     doc["ph_level"] = phGlobal; 
     
     char bufferPayload[200];
     serializeJson(doc, bufferPayload);
-    mqttClient.publish(topic_sensor, bufferPayload);
+    
+    if(mqttClient.publish(topic_sensor, bufferPayload)) {
+        Serial.println("✅ Data sensor berhasil dikirim ke Dashboard");
+    } else {
+        Serial.println("❌ Gagal mengirim data (Koneksi Terputus/Throttled)");
+    }
   }
 }

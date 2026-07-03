@@ -1,79 +1,197 @@
 import os
 import json
 import uuid
+import threading
+import tempfile
+import glob
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import paho.mqtt.client as mqtt
 from apscheduler.schedulers.background import BackgroundScheduler
 from supabase import create_client, Client
+from dotenv import load_dotenv
 
-# IMPORT LIBRARY BARU DARI ROBOFLOW
+# Muat variabel dari file .env
+load_dotenv()
+
+# IMPORT LIBRARY ROBOFLOW
 from inference_sdk import InferenceHTTPClient
 
 app = Flask(__name__)
 CORS(app)
 
 # ==============================================================================
-# KONFIGURASI GLOBAL & API
+# KONFIGURASI GLOBAL & API — Dibaca dari .env, TIDAK hardcoded
 # ==============================================================================
-MQTT_BROKER = "broker.emqx.io"
-MQTT_PORT = 1883
+MQTT_BROKER = os.getenv("MQTT_BROKER", "broker.emqx.io")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 TOPIC_SENSOR = "visio/bioflok/sensor"
 TOPIC_KONTROL = "visio/bioflok/kontrol"
 
-# --- KONFIGURASI ROBOFLOW WORKFLOW ---
-# Menggunakan SDK sesuai dengan snippet dari Roboflow
+# --- KONFIGURASI ROBOFLOW ---
+_roboflow_api_key = os.getenv("ROBOFLOW_API_KEY", "")
+_roboflow_api_url = os.getenv("ROBOFLOW_API_URL", "https://serverless.roboflow.com")
+WORKSPACE_NAME  = os.getenv("ROBOFLOW_WORKSPACE", "")
+WORKFLOW_ID     = os.getenv("ROBOFLOW_WORKFLOW_ID", "")
+CLASS_IKAN_KENYANG = "ikan kenyang"
+
 ROBOFLOW_CLIENT = InferenceHTTPClient(
-    api_url="https://serverless.roboflow.com",
-    api_key="hX1iQ1FK8QVJOV1ksVE4"
+    api_url=_roboflow_api_url,
+    api_key=_roboflow_api_key,
 )
-WORKSPACE_NAME = "ai-lele"
-WORKFLOW_ID = "detect-and-classify-3"
-CLASS_IKAN_KENYANG = "ikan kenyang" 
 
 # --- KONFIGURASI SUPABASE ---
-SUPABASE_URL = "https://keginmdkkgtvaxchtjug.supabase.co" # GANTI DENGAN URL SUPABASE ANDA
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtlZ2lubWRra2d0dmF4Y2h0anVnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE1ODkwOTEsImV4cCI6MjA4NzE2NTA5MX0.KGiNU8S1oLpJ1fep8p9uqVTFg0OwPRvxduGqzHLz3BU" # GANTI DENGAN KEY ANDA
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- STATE MESIN & DATA ---
-status_servo_aktif = False
+# ==============================================================================
+# STATE MESIN & LOCK (Fix #3 — Thread Safety)
+# ==============================================================================
+_state_lock = threading.Lock()
+
+status_servo_aktif    = False
 menit_jadwal_terakhir = -1
-daftar_jadwal = [] 
-id_jadwal_counter = 1
-
-data_sensor_terakhir = {"jarak_cm": 20.0, "ph_level": 7.0}
+daftar_jadwal         = []
+data_sensor_terakhir  = {"jarak_cm": 20.0, "ph_level": 7.0}
 waktu_sensor_terakhir = None
+id_sesi_sekarang      = None
+status_ai_terakhir    = "STANDBY"
+id_foto_terakhir      = None
+id_kolam_cache        = None  # Fix #6 — cache id_kolam
+url_foto_dummy        = "https://dummyimage.com/600x400/0D151B/009E83.png&text=V.I.S.I.O.N"
 
-id_sesi_sekarang = None
-status_ai_terakhir = "STANDBY"
-id_foto_terakhir = None 
-url_foto_dummy = "https://dummyimage.com/600x400/0D151B/009E83.png&text=V.I.S.I.O.N"
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+def _is_iot_online() -> bool:
+    """Fix #5 — satu fungsi terpusat untuk cek status IoT."""
+    with _state_lock:
+        ts = waktu_sensor_terakhir
+    if ts is None:
+        return False
+    return (datetime.now() - ts).total_seconds() < 30
+
+
+def hitung_persentase_pakan(jarak_cm: float) -> int:
+    tinggi_wadah_maks = 20.0
+    if jarak_cm >= tinggi_wadah_maks:
+        return 0
+    elif jarak_cm <= 2.0:
+        return 100
+    return int(((tinggi_wadah_maks - jarak_cm) / (tinggi_wadah_maks - 2.0)) * 100)
+
+
+def _dapatkan_id_kolam() -> int:
+    """Fix #6 — kembalikan id_kolam dari cache; query DB hanya jika belum ada."""
+    global id_kolam_cache
+    if id_kolam_cache is not None:
+        return id_kolam_cache
+    try:
+        res = supabase.table("kolam").select("id_kolam").limit(1).execute()
+        if res.data:
+            id_kolam_cache = res.data[0]["id_kolam"]
+            return id_kolam_cache
+    except Exception as e:
+        print(f"❌ [SUPABASE] Gagal mendapatkan id_kolam: {e}")
+    id_kolam_cache = 1  # fallback
+    return id_kolam_cache
+
+
+def _bersihkan_file_temp_lama():
+    """Fix #2 — hapus file temp yang tersisa dari session sebelumnya."""
+    for f in glob.glob("temp_*.jpg"):
+        try:
+            os.remove(f)
+            print(f"🧹 [CLEANUP] File temp lama dihapus: {f}")
+        except OSError:
+            pass
+
+
+def _parse_hasil_workflow(result: list) -> str:
+    """
+    Parse hasil run_workflow() Roboflow untuk workflow Gemini-powered.
+
+    Workflow ini menggunakan Google Gemini untuk keputusan akhir,
+    bukan langsung dari model klasifikasi CNN.
+
+    Urutan prioritas output:
+    1. 'feeding_status' — keputusan akhir dari Gemini (final_feeding_status)
+       Nilai: "Kenyang" | "Belum Kenyang" | "Tidak Valid"
+    2. 'centroid_feeding_analysis' — raw output Gemini centroid
+       Nilai: "Kenyang" | "Belum Kenyang"
+    3. 'classification_predictions' — fallback dari model CNN (ai-lele/6)
+       Nilai: list of dicts dengan key 'top'
+    4. Fallback ke 'Tidak Terdeteksi'
+    """
+    if not isinstance(result, list) or len(result) == 0:
+        return "Tidak Terdeteksi"
+
+    first_result = result[0]
+
+    # --- DEBUG: Tampilkan raw output untuk diagnosa ---
+    print(f"🔍 [DEBUG] Keys dalam result         : {list(first_result.keys())}")
+    print(f"🔍 [DEBUG] feeding_status            : {first_result.get('feeding_status')}")
+    print(f"🔍 [DEBUG] pond_precheck             : {first_result.get('pond_precheck')}")
+    print(f"🔍 [DEBUG] centroid_feeding_analysis : {first_result.get('centroid_feeding_analysis')}")
+    print(f"🔍 [DEBUG] classification_predictions: {first_result.get('classification_predictions')}")
+
+    # --- Prioritas 1: 'feeding_status' (keputusan akhir Gemini) ---
+    # Output: "Kenyang" | "Belum Kenyang" | "Tidak Valid"
+    feeding_status = first_result.get("feeding_status", "")
+    if feeding_status and str(feeding_status).strip():
+        hasil = str(feeding_status).strip()
+        print(f"✅ [PARSE] Hasil dari 'feeding_status' (Gemini): {hasil}")
+        return hasil
+
+    # --- Prioritas 2: 'centroid_feeding_analysis' (raw Gemini centroid) ---
+    centroid = first_result.get("centroid_feeding_analysis", "")
+    if centroid and str(centroid).strip():
+        hasil = str(centroid).strip()
+        print(f"✅ [PARSE] Hasil dari 'centroid_feeding_analysis' (Gemini): {hasil}")
+        return hasil
+
+    # --- Prioritas 3: 'classification_predictions' (fallback CNN model) ---
+    clf = first_result.get("classification_predictions")
+    if clf:
+        if isinstance(clf, list) and len(clf) > 0:
+            kelas = clf[0].get("top", "").strip()
+            if kelas:
+                print(f"✅ [PARSE] Hasil dari 'classification_predictions' (list): {kelas}")
+                return kelas
+        elif isinstance(clf, dict):
+            kelas = clf.get("top", "").strip()
+            if kelas:
+                print(f"✅ [PARSE] Hasil dari 'classification_predictions' (dict): {kelas}")
+                return kelas
+
+    print("⚠️ [PARSE] Tidak ada prediksi valid ditemukan, fallback ke 'Tidak Terdeteksi'")
+    return "Tidak Terdeteksi"
+
 
 # ==============================================================================
 # KONTROL MQTT & SENSOR
 # ==============================================================================
-def hitung_persentase_pakan(jarak_cm):
-    tinggi_wadah_maks = 20.0
-    if jarak_cm >= tinggi_wadah_maks: return 0
-    elif jarak_cm <= 2.0: return 100
-    return int(((tinggi_wadah_maks - jarak_cm) / (tinggi_wadah_maks - 2.0)) * 100)
-
 def on_connect(client, userdata, flags, rc):
     print(f"MQTT Terhubung! (Code: {rc})")
     client.subscribe(TOPIC_SENSOR)
 
+
 def on_message(client, userdata, msg):
+    # Fix #4 — tidak lagi silent pass, error di-log
     global data_sensor_terakhir, waktu_sensor_terakhir
     try:
         if msg.topic == TOPIC_SENSOR:
-            payload = json.loads(msg.payload.decode('utf-8'))
-            data_sensor_terakhir["jarak_cm"] = payload.get("jarak_cm", 20.0)
-            data_sensor_terakhir["ph_level"] = payload.get("ph_level", 7.0)
-            waktu_sensor_terakhir = datetime.now()
+            payload = json.loads(msg.payload.decode("utf-8"))
+            with _state_lock:
+                data_sensor_terakhir["jarak_cm"] = payload.get("jarak_cm", 20.0)
+                data_sensor_terakhir["ph_level"]  = payload.get("ph_level",  7.0)
+                waktu_sensor_terakhir = datetime.now()
     except Exception as e:
-        pass
+        print(f"⚠️ [MQTT] Gagal memproses pesan sensor: {e}")
+
 
 mqtt_client = mqtt.Client()
 mqtt_client.on_connect = on_connect
@@ -81,64 +199,71 @@ mqtt_client.on_message = on_message
 mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
 mqtt_client.loop_start()
 
+
 # ==============================================================================
-# FUNGSI PICU PAKAN (MEMULAI SESI)
+# FUNGSI PICU PAKAN (MEMULAI / MENGHENTIKAN SESI)
 # ==============================================================================
 def mulai_pakan():
     global status_servo_aktif, id_sesi_sekarang, status_ai_terakhir, id_foto_terakhir
-    status_servo_aktif = True
-    id_sesi_sekarang = str(uuid.uuid4())
-    status_ai_terakhir = "IKAN LAPAR (PROSES)"
-    id_foto_terakhir = None 
+    id_kolam = _dapatkan_id_kolam()
 
-    # --- KODE BARU: INSERT KE TABEL sesi_pakan DI SUPABASE ---
+    with _state_lock:
+        status_servo_aktif = True
+        id_sesi_sekarang   = str(uuid.uuid4())
+        status_ai_terakhir = "IKAN LAPAR (PROSES)"
+        id_foto_terakhir   = None
+        sesi_id_copy       = id_sesi_sekarang
+
+    # Fix #8b — sertakan id_kolam saat INSERT sesi_pakan
     try:
-        # Sesuaikan kunci (key) dictionary ini jika tabel sesi_pakan Anda 
-        # memiliki kolom wajib lain selain id_sesi
-        data_sesi_baru = {
-            "id_sesi": id_sesi_sekarang
-            # "waktu_mulai": datetime.now().isoformat() # Buka komentar ini jika Anda punya kolom waktu_mulai
-        }
-        supabase.table("sesi_pakan").insert(data_sesi_baru).execute()
-        print(f"✅ [SUPABASE] Sesi Pakan Induk berhasil dibuat!")
+        supabase.table("sesi_pakan").insert({
+            "id_sesi":  sesi_id_copy,
+            "id_kolam": id_kolam,
+        }).execute()
+        print(f"✅ [SUPABASE] Sesi Pakan dibuat: {sesi_id_copy}")
     except Exception as e:
-        print(f"❌ [SUPABASE] Gagal membuat Sesi Pakan Induk: {e}")
-    # ---------------------------------------------------------
+        print(f"❌ [SUPABASE] Gagal membuat Sesi Pakan: {e}")
 
     mqtt_client.publish(TOPIC_KONTROL, '{"perintah_servo": "buka"}')
-    print(f">> PAKAN DIMULAI | ID Sesi: {id_sesi_sekarang}")
+    print(f">> PAKAN DIMULAI | ID Sesi: {sesi_id_copy}")
+
 
 def hentikan_pakan():
     global status_servo_aktif, id_sesi_sekarang, status_ai_terakhir
-    
-    # Simpan ID sesi sebelum di-reset, agar bisa di-update ke database
-    id_sesi_yang_berhenti = id_sesi_sekarang
-    
-    status_servo_aktif = False
-    id_sesi_sekarang = None
-    status_ai_terakhir = "STANDBY"
+
+    with _state_lock:
+        id_sesi_yang_berhenti = id_sesi_sekarang
+        status_servo_aktif    = False
+        id_sesi_sekarang      = None
+        status_ai_terakhir    = "STANDBY"
+
     mqtt_client.publish(TOPIC_KONTROL, '{"perintah_servo": "tutup"}')
-    
-    # --- UPDATE waktu_selesai ke tabel sesi_pakan ---
+
     if id_sesi_yang_berhenti:
         try:
             supabase.table("sesi_pakan").update({
                 "waktu_selesai": datetime.now().isoformat()
             }).eq("id_sesi", id_sesi_yang_berhenti).execute()
-            print(f"✅ [SUPABASE] waktu_selesai berhasil dicatat untuk sesi: {id_sesi_yang_berhenti}")
+            print(f"✅ [SUPABASE] waktu_selesai dicatat: {id_sesi_yang_berhenti}")
         except Exception as e:
             print(f"❌ [SUPABASE] Gagal mencatat waktu_selesai: {e}")
-    # -------------------------------------------------
-    
+
     print(">> PAKAN DIHENTIKAN")
 
+
 # ==============================================================================
-# SCHEDULER & ROUTING API
+# SCHEDULER JOBS
 # ==============================================================================
 def cek_dan_eksekusi_jadwal():
     global menit_jadwal_terakhir
     sekarang = datetime.now()
-    ada_jadwal = any(j['jam'] == sekarang.hour and j['menit'] == sekarang.minute for j in daftar_jadwal)
+    with _state_lock:
+        jadwal_copy = list(daftar_jadwal)
+
+    ada_jadwal = any(
+        j["jam"] == sekarang.hour and j["menit"] == sekarang.minute
+        for j in jadwal_copy
+    )
 
     if ada_jadwal:
         if menit_jadwal_terakhir != sekarang.minute:
@@ -147,323 +272,293 @@ def cek_dan_eksekusi_jadwal():
     else:
         menit_jadwal_terakhir = -1
 
-def simpan_riwayat_ph_ke_supabase():
-    global waktu_sensor_terakhir
-    try:
-        # Jangan simpan jika IoT offline / belum pernah mengirim data
-        is_iot_aktif = False
-        if waktu_sensor_terakhir is not None:
-            selisih = (datetime.now() - waktu_sensor_terakhir).total_seconds()
-            if selisih < 30:
-                is_iot_aktif = True
-                
-        if not is_iot_aktif:
-            print("⚠️ [SUPABASE] Batal menyimpan riwayat pH berkala karena sensor IoT offline.")
-            return
 
-        # Ambil id_kolam pertama dari database (default 1 jika kosong)
-        id_kolam = 1
-        res_kolam = supabase.table("kolam").select("id_kolam").limit(1).execute()
-        if res_kolam.data:
-            id_kolam = res_kolam.data[0]["id_kolam"]
-            
+def simpan_riwayat_ph_ke_supabase():
+    if not _is_iot_online():
+        print("⚠️ [SUPABASE] Batal menyimpan riwayat pH — sensor IoT offline.")
+        return
+
+    id_kolam = _dapatkan_id_kolam()
+    with _state_lock:
         ph = round(data_sensor_terakhir["ph_level"], 2)
-        data_insert = {
-            "id_kolam": id_kolam,
-            "ph_level": ph,
-            "waktu_rekam": datetime.now().isoformat()
-        }
-        supabase.table("riwayat_ph").insert(data_insert).execute()
-        print(f"✅ [SUPABASE] Berhasil menyimpan riwayat pH berkala: {ph} (Kolam ID: {id_kolam})")
+
+    try:
+        supabase.table("riwayat_ph").insert({
+            "id_kolam":    id_kolam,
+            "ph_level":    ph,
+            "waktu_rekam": datetime.now().isoformat(),
+        }).execute()
+        print(f"✅ [SUPABASE] Riwayat pH berkala disimpan: {ph} (Kolam ID: {id_kolam})")
     except Exception as e:
-        print(f"❌ [SUPABASE] Gagal menyimpan riwayat pH berkala: {e}")
+        print(f"❌ [SUPABASE] Gagal menyimpan riwayat pH: {e}")
+
+
+def muat_jadwal_dari_supabase():
+    """Fix #7 — dipanggil saat startup DAN secara berkala tiap 5 menit."""
+    global daftar_jadwal
+    try:
+        response = supabase.table("jadwal_pakan").select("id, jam, menit").execute()
+        jadwal_baru = sorted(response.data, key=lambda x: (x["jam"], x["menit"]))
+        with _state_lock:
+            daftar_jadwal = jadwal_baru
+        print(f"✅ [SUPABASE] {len(daftar_jadwal)} jadwal pakan dimuat/diperbarui.")
+    except Exception as e:
+        print(f"❌ [SUPABASE] Gagal memuat jadwal: {e}")
+
+
+# ==============================================================================
+# INISIALISASI SCHEDULER
+# ==============================================================================
+_bersihkan_file_temp_lama()  # Fix #2 — bersihkan sisa file lama saat startup
+_dapatkan_id_kolam()          # Fix #6 — pre-cache id_kolam
+muat_jadwal_dari_supabase()   # Fix #7 — muat jadwal awal
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=cek_dan_eksekusi_jadwal, trigger="interval", seconds=10)
+scheduler.add_job(func=cek_dan_eksekusi_jadwal,       trigger="interval", seconds=10)
 scheduler.add_job(func=simpan_riwayat_ph_ke_supabase, trigger="interval", minutes=30)
+scheduler.add_job(func=muat_jadwal_dari_supabase,      trigger="interval", minutes=5)  # Fix #7
 scheduler.start()
 
-@app.route('/api/status', methods=['GET'])
-def get_status():
-    global waktu_sensor_terakhir
-    
-    is_iot_aktif = False
-    if waktu_sensor_terakhir is not None:
-        selisih = (datetime.now() - waktu_sensor_terakhir).total_seconds()
-        if selisih < 30:
-            is_iot_aktif = True
 
-    ph = round(data_sensor_terakhir["ph_level"], 2)
+# ==============================================================================
+# API ENDPOINTS
+# ==============================================================================
+@app.route("/api/status", methods=["GET"])
+def get_status():
+    with _state_lock:
+        sensor_copy = dict(data_sensor_terakhir)
+        servo_aktif = status_servo_aktif
+        ai_status   = status_ai_terakhir
+        id_sesi     = id_sesi_sekarang
+        id_foto     = id_foto_terakhir
+        jadwal_copy = list(daftar_jadwal)
+
+    online   = _is_iot_online()
+    ph       = round(sensor_copy["ph_level"], 2)
     kualitas = "Peringatan Anomali" if ph < 6.5 or ph > 8.5 else "Optimal"
-    
+
     return jsonify({
-        "tingkat_ph": ph if is_iot_aktif else None,
-        "kualitas_air": kualitas if is_iot_aktif else "Offline",
-        "is_iot_aktif": is_iot_aktif,
-        "persen_sisa_pakan": hitung_persentase_pakan(data_sensor_terakhir["jarak_cm"]) if is_iot_aktif else 0,
-        "status_servo_aktif": status_servo_aktif,
-        "status_ai_terakhir": status_ai_terakhir,
-        "id_sesi_aktif": id_sesi_sekarang,
-        "id_foto_terakhir": id_foto_terakhir, 
-        "daftar_jadwal": daftar_jadwal
+        "tingkat_ph":         ph if online else None,
+        "kualitas_air":       kualitas if online else "Offline",
+        "is_iot_aktif":       online,
+        "persen_sisa_pakan":  hitung_persentase_pakan(sensor_copy["jarak_cm"]) if online else 0,
+        "status_servo_aktif": servo_aktif,
+        "status_ai_terakhir": ai_status,
+        "id_sesi_aktif":      id_sesi,
+        "id_foto_terakhir":   id_foto,
+        "daftar_jadwal":      jadwal_copy,
     })
 
-@app.route('/api/kontrol', methods=['POST'])
-def kontrol_manual():
-    global id_sesi_sekarang # Pastikan kita bisa membaca ID sesi sebelum dihapus
 
-    aksi = request.json.get('aksi')
-    
-    if aksi == 'feed' and not status_servo_aktif:
+@app.route("/api/kontrol", methods=["POST"])
+def kontrol_manual():
+    aksi = request.json.get("aksi")
+
+    with _state_lock:
+        servo_aktif   = status_servo_aktif
+        sesi_sekarang = id_sesi_sekarang
+
+    if aksi == "feed" and not servo_aktif:
         mulai_pakan()
         return jsonify({"status": "sukses"})
-        
-    elif aksi == 'stop' and status_servo_aktif:
-        # =====================================================================
-        # TAMBAHAN BARU: Simpan log "Override Manual" ke Supabase
-        # =====================================================================
-        if id_sesi_sekarang:
+
+    elif aksi == "stop" and servo_aktif:
+        if sesi_sekarang:
             try:
-                data_insert = {
-                    "id_foto": str(uuid.uuid4()),
-                    "id_sesi": id_sesi_sekarang,
-                    "url_foto": url_foto_dummy, # Gunakan URL dummy karena tidak ada foto AI final
-                    "status_ikan": "DIHENTIKAN MANUAL" # Status khusus untuk penanda
-                }
-                supabase.table("log_visual_ai").insert(data_insert).execute()
-                print(f"✅ [DATABASE] Log Override Manual tersimpan!")
+                supabase.table("log_visual_ai").insert({
+                    "id_foto":     str(uuid.uuid4()),
+                    "id_sesi":     sesi_sekarang,
+                    "url_foto":    url_foto_dummy,
+                    "status_ikan": "DIHENTIKAN MANUAL",
+                }).execute()
+                print("✅ [DATABASE] Log Override Manual tersimpan!")
             except Exception as e:
                 print(f"❌ [DATABASE] Error menyimpan log override: {e}")
-        # =====================================================================
-        
-        hentikan_pakan() # Panggil fungsi ini SETELAH data disimpan
+
+        hentikan_pakan()
         return jsonify({"status": "sukses"})
-        
+
     return jsonify({"status": "diabaikan"})
 
-@app.route('/api/prediksi-kamera', methods=['POST'])
+
+@app.route("/api/prediksi-kamera", methods=["POST"])
 def prediksi_kamera():
     global status_ai_terakhir, id_foto_terakhir
-    
-    if not status_servo_aktif:
+
+    with _state_lock:
+        servo_aktif = status_servo_aktif
+
+    if not servo_aktif:
         return jsonify({"status": "diabaikan", "pesan": "Kamera standby"})
 
-    if 'image' in request.files:
-        image_bytes = request.files['image'].read()
+    if "image" in request.files:
+        image_bytes = request.files["image"].read()
     else:
         image_bytes = request.data
-        
+
     if not image_bytes:
         return jsonify({"error": "Tidak ada gambar"}), 400
 
-    # 1. Simpan sementara gambar ke hardisk
-    temp_filename = f"temp_{uuid.uuid4().hex}.jpg"
-    with open(temp_filename, "wb") as f:
-        f.write(image_bytes)
+    # Fix #2 — gunakan tempfile agar otomatis terhapus
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    temp_filename = tmp.name
+    hasil_prediksi_ai = "Tidak Terdeteksi"
 
     try:
-        # 2. Jalankan Workflow Roboflow
+        tmp.write(image_bytes)
+        tmp.close()
+
+        # Jalankan Workflow Roboflow
+        # Fix: use_cache=False agar setiap gambar diproses ulang, tidak pakai cache
         result = ROBOFLOW_CLIENT.run_workflow(
             workspace_name=WORKSPACE_NAME,
             workflow_id=WORKFLOW_ID,
             images={"image": temp_filename},
-            use_cache=True
+            use_cache=False,
         )
-        
-        hasil_prediksi_ai = "Tidak Terdeteksi"
-        if isinstance(result, list) and len(result) > 0:
-            first_result = result[0]
-            for key, value in first_result.items():
-                if isinstance(value, dict) and "predictions" in value:
-                    if len(value["predictions"]) > 0:
-                        hasil_prediksi_ai = value["predictions"][0].get("class", "Tidak Terdeteksi")
-                        break
-                elif isinstance(value, dict) and "top" in value:
-                    hasil_prediksi_ai = value.get("top", "Tidak Terdeteksi")
-                    break
+
+        # Fix: parsing hasil workflow secara robust via fungsi terpisah
+        hasil_prediksi_ai = _parse_hasil_workflow(result)
 
     except Exception as e:
         pesan_error = str(e)
         print(f"❌ [ERROR ROBOFLOW]: {pesan_error}")
-        
-        # Hapus file sementara agar tidak menumpuk
-        if os.path.exists(temp_filename): 
-            os.remove(temp_filename)
-            
-        # TANGKAL BUG ROBOFLOW: Jika error karena dynamic_crop (tidak ada objek)
+
+        # Tangani kasus tidak ada ikan terdeteksi (dynamic_crop gagal)
         if "dynamic_crop" in pesan_error.lower():
-            print(">> INFO: Roboflow gagal memotong gambar (Kemungkinan besar tidak ada ikan yang terlihat).")
-            # Anggap saja sebagai "Tidak Terdeteksi" dan kembalikan status sukses ke ESP32
+            print(">> INFO: Roboflow gagal crop (tidak ada ikan terlihat).")
             return jsonify({
-                "status": "sukses", 
-                "status_ikan": "Tidak Terdeteksi", 
-                "servo_dimatikan_ai": False
+                "status":            "sukses",
+                "status_ikan":       "Tidak Terdeteksi",
+                "servo_dimatikan_ai": False,
             })
-            
-        # Jika error lain (misal API Key salah, kuota habis), baru kembalikan 500
+
         return jsonify({"error": pesan_error}), 500
 
-    status_ai_terakhir = hasil_prediksi_ai
+    finally:
+        # Fix #2 — pastikan file temp selalu terhapus
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
+
+    with _state_lock:
+        status_ai_terakhir  = hasil_prediksi_ai
+        sesi_aktif_saat_ini = id_sesi_sekarang
+
     print(f"✅ [AI VISION] Mendeteksi: {hasil_prediksi_ai}")
-    sesi_aktif_saat_ini = id_sesi_sekarang
 
-    # =====================================================================
-    # LOGIKA UPLOAD FOTO KE SUPABASE JIKA IKAN TERDETEKSI KENYANG
-    # =====================================================================
-    hasil_teks = str(hasil_prediksi_ai).lower()
+    hasil_teks   = str(hasil_prediksi_ai).lower()
     dimatikan_ai = False
-    url_foto_final = url_foto_dummy 
+    url_foto_final = url_foto_dummy
 
-    # LOGIKA BARU: Pastikan ada kata "kenyang", TETAPI TIDAK ADA kata "belum"
     if "kenyang" in hasil_teks and "belum" not in hasil_teks:
         print(">> MENGUNGGAH FOTO BUKTI AI KE SUPABASE STORAGE...")
         try:
             nama_file_storage = f"bukti_kenyang_{uuid.uuid4().hex}.jpg"
-            
-            with open(temp_filename, "rb") as f:
-                file_upload = f.read()
-            
-            # Upload ke bucket 'foto-ai'
-            res = supabase.storage.from_("foto-ai").upload(
-                file=file_upload,
+            supabase.storage.from_("foto-ai").upload(
+                file=image_bytes,
                 path=nama_file_storage,
-                file_options={"content-type": "image/jpeg"}
+                file_options={"content-type": "image/jpeg"},
             )
-            
             url_foto_final = supabase.storage.from_("foto-ai").get_public_url(nama_file_storage)
-            print(f"✅ [STORAGE] Foto berhasil diunggah: {url_foto_final}")
-            
+            print(f"✅ [STORAGE] Foto diunggah: {url_foto_final}")
         except Exception as e:
             print(f"❌ [STORAGE] Gagal mengunggah foto: {e}")
-            
-        # Matikan servo HANYA JIKA benar-benar kenyang
+
         hentikan_pakan()
         dimatikan_ai = True
-    # =====================================================================
 
-    # Hapus file sementara dari laptop
-    if os.path.exists(temp_filename):
-        os.remove(temp_filename)
-
-    # 4. INSERT KE TABEL SUPABASE (Gunakan sesi_aktif_saat_ini yang sudah diamankan)
     if sesi_aktif_saat_ini:
         id_foto_baru = str(uuid.uuid4())
-        id_foto_terakhir = id_foto_baru 
-        
+        with _state_lock:
+            id_foto_terakhir = id_foto_baru
         try:
-            data_insert = {
-                "id_foto": id_foto_baru,
-                "id_sesi": sesi_aktif_saat_ini, # Menggunakan variabel lokal yang aman
-                "url_foto": url_foto_final,
-                "status_ikan": str(hasil_prediksi_ai) 
-            }
-            supabase.table("log_visual_ai").insert(data_insert).execute()
-            print(f"✅ [DATABASE] Log tersimpan dengan URL: {url_foto_final}")
+            supabase.table("log_visual_ai").insert({
+                "id_foto":     id_foto_baru,
+                "id_sesi":     sesi_aktif_saat_ini,
+                "url_foto":    url_foto_final,
+                "status_ikan": str(hasil_prediksi_ai),
+            }).execute()
+            print(f"✅ [DATABASE] Log tersimpan: {url_foto_final}")
         except Exception as e:
             print(f"❌ [DATABASE] Error menyimpan log: {e}")
-        
+
     return jsonify({
-        "status": "sukses", 
-        "status_ikan": hasil_prediksi_ai, 
-        "servo_dimatikan_ai": dimatikan_ai
+        "status":            "sukses",
+        "status_ikan":       hasil_prediksi_ai,
+        "servo_dimatikan_ai": dimatikan_ai,
     })
 
-# ==============================================================================
-# INISIALISASI & JADWAL API (TERINTEGRASI SUPABASE)
-# ==============================================================================
 
-# Fungsi ini akan dipanggil otomatis saat Flask pertama kali dijalankan
-def muat_jadwal_dari_supabase():
-    global daftar_jadwal
-    try:
-        # Menarik semua data jadwal dari tabel 'jadwal_pakan' di Supabase
-        response = supabase.table("jadwal_pakan").select("id, jam, menit").execute()
-        daftar_jadwal = response.data
-        # Urutkan berdasarkan jam dan menit dari pagi ke malam
-        daftar_jadwal = sorted(daftar_jadwal, key=lambda x: (x['jam'], x['menit']))
-        print(f"✅ [SUPABASE] Berhasil memuat {len(daftar_jadwal)} jadwal pakan dari database.")
-    except Exception as e:
-        print(f"❌ [SUPABASE] Gagal memuat jadwal: {e}")
-
-# Panggil fungsi ini SATU KALI sebelum masuk ke route API
-muat_jadwal_dari_supabase()
-
-@app.route('/api/jadwal', methods=['GET', 'POST', 'DELETE'])
+@app.route("/api/jadwal", methods=["GET", "POST", "DELETE"])
 def kelola_jadwal():
     global daftar_jadwal
-    
-    if request.method == 'GET':
-        return jsonify(daftar_jadwal)
-        
-    elif request.method == 'POST':
-        data = request.json
-        jam = data.get('jam')
-        menit = data.get('menit')
-        
-        if jam is None or menit is None: 
+
+    if request.method == "GET":
+        with _state_lock:
+            return jsonify(list(daftar_jadwal))
+
+    elif request.method == "POST":
+        data  = request.json
+        jam   = data.get("jam")
+        menit = data.get("menit")
+
+        if jam is None or menit is None:
             return jsonify({"error": "Format tidak valid"}), 400
-            
-        if any(j['jam'] == jam and j['menit'] == menit for j in daftar_jadwal):
+
+        with _state_lock:
+            exists = any(j["jam"] == jam and j["menit"] == menit for j in daftar_jadwal)
+        if exists:
             return jsonify({"error": "Jadwal pada waktu tersebut sudah ada"}), 409
-            
+
         try:
-            # 1. Simpan (Insert) ke Supabase
-            data_insert = {"jam": jam, "menit": menit}
-            response = supabase.table("jadwal_pakan").insert(data_insert).execute()
-            
-            # 2. Ambil data yang baru masuk (lengkap dengan ID otomatisnya)
+            response    = supabase.table("jadwal_pakan").insert({"jam": jam, "menit": menit}).execute()
             jadwal_baru = response.data[0]
-            
-            # 3. Perbarui variabel lokal di RAM agar scheduler tidak perlu 
-            #    bertanya ke Supabase setiap 10 detik (menghemat kuota)
-            daftar_jadwal.append(jadwal_baru)
-            daftar_jadwal = sorted(daftar_jadwal, key=lambda x: (x['jam'], x['menit']))
-            
-            print(f"✅ [DATABASE] Jadwal baru ditambahkan: {jam:02d}:{menit:02d}")
+            with _state_lock:
+                daftar_jadwal.append(jadwal_baru)
+                daftar_jadwal = sorted(daftar_jadwal, key=lambda x: (x["jam"], x["menit"]))
+            print(f"✅ [DATABASE] Jadwal baru: {jam:02d}:{menit:02d}")
             return jsonify({"status": "sukses", "data": jadwal_baru}), 201
-            
         except Exception as e:
             print(f"❌ [DATABASE] Error Insert Jadwal: {e}")
             return jsonify({"error": "Gagal menyimpan jadwal"}), 500
-            
-    elif request.method == 'DELETE':
-        ids_hapus = request.args.get('ids')
-        id_hapus = request.args.get('id', type=int)
-        
+
+    elif request.method == "DELETE":
+        ids_hapus = request.args.get("ids")
+        id_hapus  = request.args.get("id", type=int)
+
         try:
             if ids_hapus:
-                list_ids = [int(i) for i in ids_hapus.split(',') if i.strip()]
+                list_ids = [int(i) for i in ids_hapus.split(",") if i.strip()]
                 if not list_ids:
                     return jsonify({"error": "ID tidak valid"}), 400
-                
                 supabase.table("jadwal_pakan").delete().in_("id", list_ids).execute()
-                daftar_jadwal = [j for j in daftar_jadwal if j.get('id') not in list_ids]
-                
-                print(f"🗑️ [DATABASE] {len(list_ids)} jadwal berhasil dihapus secara massal.")
+                with _state_lock:
+                    daftar_jadwal[:] = [j for j in daftar_jadwal if j.get("id") not in list_ids]
+                print(f"🗑️ [DATABASE] {len(list_ids)} jadwal dihapus massal.")
                 return jsonify({"status": "sukses"})
+
             elif id_hapus is not None:
-                # 1. Hapus dari Supabase berdasarkan ID
                 supabase.table("jadwal_pakan").delete().eq("id", id_hapus).execute()
-                
-                # 2. Hapus dari variabel lokal di RAM
-                daftar_jadwal = [j for j in daftar_jadwal if j.get('id') != id_hapus]
-                
-                print(f"🗑️ [DATABASE] Jadwal dengan ID {id_hapus} dihapus.")
+                with _state_lock:
+                    daftar_jadwal[:] = [j for j in daftar_jadwal if j.get("id") != id_hapus]
+                print(f"🗑️ [DATABASE] Jadwal ID {id_hapus} dihapus.")
                 return jsonify({"status": "sukses"})
+
             else:
                 return jsonify({"error": "ID tidak ditemukan"}), 400
-            
+
         except Exception as e:
             print(f"❌ [DATABASE] Error Delete Jadwal: {e}")
             return jsonify({"error": "Gagal menghapus jadwal"}), 500
 
+
 # ==============================================================================
-# MAIN PELAKSANAAN
+# MAIN
 # ==============================================================================
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
-        print("Memulai V.I.S.I.O.N Backend Server (Workflow Mode)...")
-        app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
+        print("Memulai V.I.S.I.O.N Backend Server...")
+        app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
         mqtt_client.loop_stop()
